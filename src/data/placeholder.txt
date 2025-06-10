@@ -1,0 +1,3 @@
+Where your csvs will get saved.
+You can delete this text file.
+Thanks for using InkBack!
