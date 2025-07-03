@@ -57,7 +57,7 @@ impl Application for EquityPlotter {
     }
 
     fn title(&self) -> String {
-        "Moving Average Strategy Backtests".to_string()
+        "InkBack from Scorsone Enterprises".to_string()
     }
 
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {

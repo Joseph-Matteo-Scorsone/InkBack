@@ -13,6 +13,7 @@ dependencies = [
  "iced",
  "rayon",
  "serde",
+ "serde_json",
  "time",
  "tokio",
 ]

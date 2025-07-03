@@ -4,17 +4,23 @@ use std::collections::HashMap;
 pub struct Candle {
     /// The primary column
     pub date: String,
-    /// All other columns, keyed by the CSV header name.
+    /// All numeric columns, keyed by the CSV header name.
     pub fields: HashMap<String, f64>,
+    /// All string columns, keyed by the CSV header name.
+    pub string_fields: HashMap<String, String>,
 }
 
 impl Candle {
-    /// Look up a column by name (e.g. `"close"`).
+    /// Look up a numeric column by name (e.g. `"close"`).
     pub fn get(&self, key: &str) -> Option<f64> {
         self.fields.get(key).copied()
     }
-}
 
+    /// Look up a string column by name (e.g. `"footprint_data"`).
+    pub fn get_string(&self, key: &str) -> Option<&String> {
+        self.string_fields.get(key)
+    }
+}
 
 pub trait Strategy {
     fn on_candle(&mut self, candle: &Candle, prev: Option<&Candle>) -> Option<Order>;

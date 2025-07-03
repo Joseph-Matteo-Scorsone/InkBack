@@ -1,4 +1,4 @@
-use crate::strategy::{Candle, OrderType, Strategy};
+use crate::{strategy::{Candle, OrderType, Strategy}, InkBackSchema};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use databento::dbn::Schema;
@@ -118,12 +118,22 @@ impl BacktestResult {
 pub fn run_backtest_with_schema(
     csv_path: &str,
     schema: Schema,
+    custom_schema: Option<InkBackSchema>,
     strategy: &mut dyn Strategy,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
+    // Determine which schema to use for the handler
+    let handler_schema = if let Some(ref custom_schema) = custom_schema {
+        match custom_schema {
+            InkBackSchema::FootPrint => Schema::Ohlcv1D, // FootPrint bars are stored as OHLCV format
+        }
+    } else {
+        schema
+    };
+
     // Get the appropriate schema handler
-    let handler = get_schema_handler(schema);
+    let handler = get_schema_handler(handler_schema);
     
     // Convert CSV data to candles
     let candles = handler.csv_to_candles(csv_path)?;
@@ -234,6 +244,7 @@ pub fn run_backtest_with_candles(
 pub fn calculate_benchmark_with_schema(
     csv_path: &str,
     schema: Schema,
+    custom_schema: Option<InkBackSchema>,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
@@ -256,13 +267,20 @@ pub fn calculate_benchmark_with_schema(
     let mut equity_curve = vec![starting_equity];
     let mut trades = Vec::new();
 
-    let key = match schema {
-        Schema::Ohlcv1S | Schema::Ohlcv1M | Schema::Ohlcv1H | Schema::Ohlcv1D | Schema::OhlcvEod => "close",
-        Schema::Mbo | Schema::Trades => "price",
-        Schema::Mbp1 | Schema::Tbbo | Schema::Cbbo | Schema::Cbbo1S | Schema::Cbbo1M | Schema::Tcbbo | Schema::Bbo1S | Schema::Bbo1M => "ask_price", // for simplicity
-        Schema::Mbp10 => "level_0_ask_price", // for simplicity
-        Schema::Imbalance =>  "ref_price",
-        _ => unreachable!(),
+    // Determine the key based on custom schema or regular schema
+    let key = if let Some(ref custom_schema) = custom_schema {
+        match custom_schema {
+            InkBackSchema::FootPrint => "close", // FootPrint bars have OHLCV format
+        }
+    } else {
+        match schema {
+            Schema::Ohlcv1S | Schema::Ohlcv1M | Schema::Ohlcv1H | Schema::Ohlcv1D | Schema::OhlcvEod => "close",
+            Schema::Mbo | Schema::Trades => "price",
+            Schema::Mbp1 | Schema::Tbbo | Schema::Cbbo | Schema::Cbbo1S | Schema::Cbbo1M | Schema::Tcbbo | Schema::Bbo1S | Schema::Bbo1M => "ask_price", // for simplicity
+            Schema::Mbp10 => "level_0_ask_price", // for simplicity
+            Schema::Imbalance =>  "ref_price",
+            _ => unreachable!(),
+        }
     };
 
     let first_close = first_candle.get(key)
@@ -312,18 +330,20 @@ pub fn calculate_benchmark_with_schema(
 pub fn run_backtest(
     path: &str,
     schema: Schema,
+    custom_schema: Option<InkBackSchema>,
     strategy: &mut dyn Strategy,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
-    run_backtest_with_schema(path, schema, strategy, starting_equity, exposure)
+    run_backtest_with_schema(path, schema, custom_schema, strategy, starting_equity, exposure)
 }
 
 pub fn calculate_benchmark(
     path: &str,
     schema: Schema,
+    custom_schema: Option<InkBackSchema>,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
-    calculate_benchmark_with_schema(path, schema, starting_equity, exposure)
+    calculate_benchmark_with_schema(path, schema, custom_schema, starting_equity, exposure)
 }
