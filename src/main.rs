@@ -156,11 +156,12 @@ async fn main() -> anyhow::Result<()> {
     let client = databento::HistoricalClient::builder().key_from_env()?.build()?;
 
     // Fetch and save daily OHLCV candles to CSV
-    let csv_path = fetch_and_save_csv(client, "GLBX.MDP3", "ES.v.0", Schema::Ohlcv1D, start, end).await?;
+    let schema = Schema::Ohlcv1D;
+    let csv_path = fetch_and_save_csv(client, "GLBX.MDP3", "ES.v.0", schema, start, end).await?;
     //let csv_path = fetch_and_save_csv(client, "XNAS.ITCH", "AAPL", Schema::Ohlcv1D, start, end).await?;
 
     // Run a benchmark buy-and-hold simulation
-    let benchmark = backtester::calculate_benchmark(&csv_path, starting_equity, exposure)?;
+    let benchmark = backtester::calculate_benchmark(&csv_path, schema, starting_equity, exposure)?;
     
     // Store equity curves for plotting
     let mut equity_curves: Vec<(String, Vec<f64>)> = Vec::new();
@@ -199,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
 
             let result = backtester::run_backtest(
                 &csv_path,
+                schema,
                 &mut strategy,
                 starting_equity,
                 exposure,

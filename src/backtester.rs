@@ -311,17 +311,19 @@ pub fn calculate_benchmark_with_schema(
 // Backward compatibility - keep the original function
 pub fn run_backtest(
     path: &str,
+    schema: Schema,
     strategy: &mut dyn Strategy,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
-    run_backtest_with_schema(path, Schema::Ohlcv1D, strategy, starting_equity, exposure)
+    run_backtest_with_schema(path, schema, strategy, starting_equity, exposure)
 }
 
 pub fn calculate_benchmark(
     path: &str,
+    schema: Schema,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
-    calculate_benchmark_with_schema(path, Schema::Ohlcv1D, starting_equity, exposure)
+    calculate_benchmark_with_schema(path, schema, starting_equity, exposure)
 }
