@@ -36,6 +36,7 @@ Every run also shows an Iced window with the equity curves for every back test a
 
 # Issues
 - Entry prices of the candle's close, not the next candle's open.
+- No slippage.
 
 
 # DISCLAIMER
