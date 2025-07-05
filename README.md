@@ -16,8 +16,8 @@ git clone the repo
 ```https://github.com/Joseph-Matteo-Scorsone/InkBack.git```
 Then set your .env file and your DataBento API key in it as DATABENTO_API_KEY.
 
-I designed this so that way users can make thier own struct and then impl Strategy for it. The default that it comes with is a Moving Average cross.
-The Moving average cross is what you should delete to make your own strategy.
+I designed this so that way users can make thier own struct and then impl Strategy for it. The default that it comes with is an order flow footprint imbalance detector.
+That is what you should delete to make your own strategy.
 
 There needs to be an on_candle method to be called by the back tester.
 on_candle needs a candle and for convenience accepts the previous candle as well so you have both.
