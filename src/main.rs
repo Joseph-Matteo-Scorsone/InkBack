@@ -13,11 +13,12 @@ mod utils;
 mod strategy;
 mod backtester;
 mod plot;
+pub mod slippage_models;
 
 use plot::plot_equity_curves;
 use strategy::Strategy;
 use utils::fetch::fetch_and_save_csv;
-use crate::strategy::{Candle, Order, OrderType, StrategyParams};
+use crate::{slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
 
 // Custom schemas
 pub enum InkBackSchema {
@@ -287,11 +288,11 @@ async fn main() -> anyhow::Result<()> {
     let mut equity_curves: Vec<(String, Vec<f64>)> = Vec::new();
 
     // Footprint strategy parameter ranges
-    let imbalance_thresholds = vec![0.2, 0.3]; // 10%, 20%, 30% imbalance
-    let volume_thresholds = vec![100, 200, 500]; // Minimum volume
+    let imbalance_thresholds = vec![0.10, 0.2, 0.3]; // imbalance percent
+    let volume_thresholds = vec![200, 500]; // Minimum volume
     let lookback_periods = vec![3, 5]; // Lookback periods for average imbalance
-    let tp_windows = vec![0.005, 0.01]; // 1%, 2% take profit
-    let sl_windows = vec![0.005, 0.01]; // 0.5%, 1% stop loss
+    let tp_windows = vec![0.0025, 0.005]; // take profit
+    let sl_windows = vec![0.0025, 0.005]; // stop loss
 
     // Generate all combinations of parameters using nested loops
     let mut parameter_combinations = Vec::new();
@@ -313,6 +314,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+
+    // Set the tick size for the future you are trading
+    let es_tick_size: f64 = 0.25;
+    let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
+
     // Run each strategy in parallel and collect backtest results
     let results: Vec<_> = parameter_combinations
         .par_iter()
@@ -326,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut strategy,
                 starting_equity,
                 exposure,
+                transaction_costs.clone(),
             ).expect("Backtest failed");
 
             // Format parameter combination as a label
@@ -345,13 +352,15 @@ async fn main() -> anyhow::Result<()> {
     // Print metrics and store curves for GUI plotting
     for (param_str, result) in results {
         println!(
-            "{}: final_equity: {:.2}, total_return: {:.2}%, max_drawdown: {:.2}%, win_rate: {:.2}%, profit_factor: {:.2}",
+            "{}: final_equity: {:.2}, total_return: {:.2}%, max_drawdown: {:.2}%, win_rate: {:.2}%, profit_factor: {:.2}, total_fees: ${:.2}, trades: {}",
             param_str,
             result.ending_equity,
             result.total_return_pct,
             result.max_drawdown_pct,
             result.win_rate,
-            result.profit_factor
+            result.profit_factor,
+            result.total_transaction_costs,
+            result.total_trades
         );
 
         equity_curves.push((param_str, result.equity_curve));

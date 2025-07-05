@@ -1,4 +1,5 @@
 use crate::{strategy::{Candle, OrderType, Strategy}, InkBackSchema};
+use crate::slippage_models::TransactionCosts;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use databento::dbn::Schema;
@@ -12,6 +13,31 @@ enum Position {
     Neutral,
 }
 
+impl Position {
+    fn calculate_pnl_with_costs(
+        &self,
+        exit_price: f64,
+        costs: &TransactionCosts,
+        avg_volume: f64,
+    ) -> f64 {
+        match self {
+            Position::Long { entry, size, .. } => {
+                let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
+                let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
+                let gross_pnl = (exit_price - entry) * size;
+                gross_pnl - entry_cost - exit_cost
+            }
+            Position::Short { entry, size, .. } => {
+                let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
+                let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
+                let gross_pnl = (entry - exit_price) * size;
+                gross_pnl - entry_cost - exit_cost
+            }
+            Position::Neutral => 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_date: String,
@@ -23,6 +49,7 @@ pub struct Trade {
     pub pnl_pct: f64,
     pub trade_type: String,
     pub exit_reason: String,
+    pub transaction_costs: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +71,7 @@ pub struct BacktestResult {
     pub largest_loss: f64,
     pub equity_curve: Vec<f64>,
     pub trades: Vec<Trade>,
+    pub total_transaction_costs: f64,
 }
 
 impl BacktestResult {
@@ -91,6 +119,8 @@ impl BacktestResult {
         
         let largest_win = trades.iter().map(|t| t.pnl).fold(0.0, f64::max);
         let largest_loss = trades.iter().map(|t| t.pnl).fold(0.0, f64::min);
+
+        let total_transaction_costs: f64 = trades.iter().map(|t| t.transaction_costs).sum();
         
         Self {
             starting_equity,
@@ -110,7 +140,21 @@ impl BacktestResult {
             largest_loss,
             equity_curve,
             trades,
+            total_transaction_costs,
         }
+    }
+}
+
+// Helper function to calculate average volume from candles
+fn calculate_average_volume(candles: &[Candle]) -> f64 {
+    let total_volume: f64 = candles.iter()
+        .filter_map(|candle| candle.get("volume"))
+        .sum();
+    
+    if candles.is_empty() {
+        1000000.0 // Default fallback volume
+    } else {
+        total_volume / candles.len() as f64
     }
 }
 
@@ -120,6 +164,7 @@ pub fn run_backtest_with_schema(
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
     strategy: &mut dyn Strategy,
+    transaction_costs: TransactionCosts,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
@@ -139,13 +184,14 @@ pub fn run_backtest_with_schema(
     let candles = handler.csv_to_candles(csv_path)?;
     
     // Run backtest with candles
-    run_backtest_with_candles(candles, strategy, starting_equity, exposure)
+    run_backtest_with_candles(candles, strategy, transaction_costs, starting_equity, exposure)
 }
 
 // Core backtesting logic that works with candles
 pub fn run_backtest_with_candles(
     candles: Vec<Candle>,
     strategy: &mut dyn Strategy,
+    transaction_costs: TransactionCosts,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
@@ -154,6 +200,9 @@ pub fn run_backtest_with_candles(
     let mut prev_candle: Option<Candle> = None;
     let mut trades = Vec::new();
     let mut equity_curve = Vec::new();
+
+    // Calculate average volume for transaction cost calculations
+    let avg_volume = calculate_average_volume(&candles);
 
     // Add initial equity value
     equity_curve.push(starting_equity);
@@ -164,7 +213,11 @@ pub fn run_backtest_with_candles(
                 Position::Long { entry, size, ref entry_date } => {
                     if order.order_type == OrderType::Sell {
                         let exit_price = order.price;
-                        let pnl = (exit_price - entry) * size;
+                        
+                        // Calculate PnL with transaction costs
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
+                        let transaction_cost = (exit_price - entry) * size - pnl;
+
                         equity += pnl;
 
                         trades.push(Trade {
@@ -177,6 +230,7 @@ pub fn run_backtest_with_candles(
                             pnl_pct: ((exit_price / entry) - 1.0) * 100.0,
                             trade_type: "Long".to_string(),
                             exit_reason: if exit_price >= entry * (1.0 + 0.01) { "TP" } else { "SL" }.to_string(),
+                            transaction_costs: transaction_cost,
                         });
 
                         position = Position::Neutral;
@@ -185,7 +239,11 @@ pub fn run_backtest_with_candles(
                 Position::Short { entry, size, ref entry_date } => {
                     if order.order_type == OrderType::Buy {
                         let exit_price = order.price;
-                        let pnl = (entry - exit_price) * size;
+                        
+                        // Calculate PnL with transaction costs
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
+                        let transaction_cost = (entry - exit_price) * size - pnl;
+
                         equity += pnl;
 
                         trades.push(Trade {
@@ -198,6 +256,7 @@ pub fn run_backtest_with_candles(
                             pnl_pct: ((entry / exit_price) - 1.0) * 100.0,
                             trade_type: "Short".to_string(),
                             exit_reason: if exit_price <= entry * (1.0 - 0.01) { "TP" } else { "SL" }.to_string(),
+                            transaction_costs: transaction_cost,
                         });
 
                         position = Position::Neutral;
@@ -316,6 +375,7 @@ pub fn calculate_benchmark_with_schema(
         pnl_pct,
         trade_type: "Benchmark".to_string(),
         exit_reason: "EndOfPeriod".to_string(),
+        transaction_costs: 0.0,
     });
 
     Ok(BacktestResult::calculate_metrics(
@@ -334,8 +394,9 @@ pub fn run_backtest(
     strategy: &mut dyn Strategy,
     starting_equity: f64,
     exposure: f64,
+    transactions_model: TransactionCosts,
 ) -> Result<BacktestResult> {
-    run_backtest_with_schema(path, schema, custom_schema, strategy, starting_equity, exposure)
+    run_backtest_with_schema(path, schema, custom_schema, strategy, transactions_model, starting_equity, exposure)
 }
 
 pub fn calculate_benchmark(
