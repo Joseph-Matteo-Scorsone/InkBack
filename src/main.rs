@@ -314,7 +314,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-
     // Set the tick size for the future you are trading
     let es_tick_size: f64 = 0.25;
     let transaction_costs = TransactionCosts::futures_trading(es_tick_size);

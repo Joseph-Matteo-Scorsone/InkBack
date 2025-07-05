@@ -1,4 +1,4 @@
-use crate::{strategy::{Candle, OrderType, Strategy}, InkBackSchema};
+use crate::{strategy::{Candle, Order, OrderType, Strategy}, InkBackSchema};
 use crate::slippage_models::TransactionCosts;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,7 @@ pub fn run_backtest_with_candles(
     let mut prev_candle: Option<Candle> = None;
     let mut trades = Vec::new();
     let mut equity_curve = Vec::new();
+    let mut pending_order: Option<Order> = None; // Store orders for next candle
 
     // Calculate average volume for transaction cost calculations
     let avg_volume = calculate_average_volume(&candles);
@@ -207,16 +208,65 @@ pub fn run_backtest_with_candles(
     // Add initial equity value
     equity_curve.push(starting_equity);
 
-    for candle in candles {
+    for candle in candles.iter() {
+        // First, execute any pending order from the previous candle
+        if let Some(order) = pending_order.take() {
+            match position {
+                Position::Neutral => {
+                    // Use the current candle's open price for entry
+                    let entry_price = candle.get("open")
+                        .unwrap_or_else(|| candle.get("close")
+                            .unwrap_or_else(|| candle.get("price")
+                                .unwrap_or(order.price)));
+                    
+                    // Adjust entry price for slippage and spread
+                    let adjusted_entry_price = transaction_costs.adjust_fill_price(
+                        entry_price,
+                        0.0, // Size will be calculated below
+                        avg_volume,
+                        order.order_type == OrderType::Buy
+                    );
+                    
+                    let capital = equity * exposure;
+                    let size = capital / adjusted_entry_price;
+
+                    match order.order_type {
+                        OrderType::Buy => {
+                            position = Position::Long {
+                                entry: adjusted_entry_price,
+                                size,
+                                entry_date: candle.date.clone(),
+                            };
+                        }
+                        OrderType::Sell => {
+                            position = Position::Short {
+                                entry: adjusted_entry_price,
+                                size,
+                                entry_date: candle.date.clone(),
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    // This shouldn't happen - we should only have pending orders when neutral
+                    println!("Warning: Pending order while already in position");
+                }
+            }
+        }
+
+        // Let the strategy decide what to do (entry OR exit)
+        // Strategy handles ALL trading logic including TP/SL
         if let Some(order) = strategy.on_candle(&candle, prev_candle.as_ref()) {
             match position {
+                // If we're in a position and get an order, it must be an exit
                 Position::Long { entry, size, ref entry_date } => {
                     if order.order_type == OrderType::Sell {
                         let exit_price = order.price;
                         
                         // Calculate PnL with transaction costs
                         let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
-                        let transaction_cost = (exit_price - entry) * size - pnl;
+                        let gross_pnl = (exit_price - entry) * size;
+                        let transaction_cost = gross_pnl - pnl;
 
                         equity += pnl;
 
@@ -229,7 +279,7 @@ pub fn run_backtest_with_candles(
                             pnl,
                             pnl_pct: ((exit_price / entry) - 1.0) * 100.0,
                             trade_type: "Long".to_string(),
-                            exit_reason: if exit_price >= entry * (1.0 + 0.01) { "TP" } else { "SL" }.to_string(),
+                            exit_reason: "Strategy".to_string(), // Strategy decided to exit
                             transaction_costs: transaction_cost,
                         });
 
@@ -242,7 +292,8 @@ pub fn run_backtest_with_candles(
                         
                         // Calculate PnL with transaction costs
                         let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
-                        let transaction_cost = (entry - exit_price) * size - pnl;
+                        let gross_pnl = (entry - exit_price) * size;
+                        let transaction_cost = gross_pnl - pnl;
 
                         equity += pnl;
 
@@ -255,40 +306,22 @@ pub fn run_backtest_with_candles(
                             pnl,
                             pnl_pct: ((entry / exit_price) - 1.0) * 100.0,
                             trade_type: "Short".to_string(),
-                            exit_reason: if exit_price <= entry * (1.0 - 0.01) { "TP" } else { "SL" }.to_string(),
+                            exit_reason: "Strategy".to_string(), // Strategy decided to exit
                             transaction_costs: transaction_cost,
                         });
 
                         position = Position::Neutral;
                     }
                 }
+                // If we're neutral and get an order, it's a new entry (store for next candle)
                 Position::Neutral => {
-                    let entry = order.price;
-                    let capital = equity * exposure;
-                    let size = capital / entry;
-
-                    match order.order_type {
-                        OrderType::Buy => {
-                            position = Position::Long {
-                                entry,
-                                size,
-                                entry_date: candle.date.clone(),
-                            };
-                        }
-                        OrderType::Sell => {
-                            position = Position::Short {
-                                entry,
-                                size,
-                                entry_date: candle.date.clone(),
-                            };
-                        }
-                    }
+                    pending_order = Some(order);
                 }
             }
         }
 
         equity_curve.push(equity);
-        prev_candle = Some(candle);
+        prev_candle = Some(candle.clone());
     }
 
     Ok(BacktestResult::calculate_metrics(
