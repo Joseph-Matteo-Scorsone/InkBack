@@ -30,13 +30,12 @@ I handle the 9th exponent compression in saving to the csv, it doesn't matter fo
 
 Multiple DataBento Schemas and datasets are supported by this framework.
 
-It comes as is to support back tests in parallel, users can define windows of parameters, gather every parameter combination and then run tests with each in parallel.
+It comes as is to support back tests in parallel, users can define windows of parameters, gather every parameter combination and then run tests with each in parallel. Slippage and fees are also calculated per trade.
 
 Every run also shows an Iced window with the equity curves for every back test as well as a back test for how just holding the benchmark would do.
 
 # Issues
 - Entry prices of the candle's close, not the next candle's open.
-- No slippage.
 
 
 # DISCLAIMER
