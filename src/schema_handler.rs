@@ -30,11 +30,16 @@ impl SchemaHandler for GenericCsvHandler {
             let mut fields: HashMap<String, f64> = HashMap::with_capacity(headers.len() - 1);
             let mut string_fields: HashMap<String, String> = HashMap::new();
 
-            // parse all other columns - try as f64 first, then store as string
+            // parse all other columns try as f64 first, then store as string
             for (i, header) in headers.iter().enumerate().skip(1) {
                 if let Some(val_str) = rec.get(i) {
                     if let Ok(val) = val_str.parse::<f64>() {
-                        fields.insert(header.to_string(), val);
+                        // Filter out extremely large values that are essentially sentinel values
+                        // Special handling for timestamp fields (expiration, activation, etc.)
+                        if val.is_finite() && (val.abs() < 1e15 || header.contains("expiration") || header.contains("activation") || header.contains("ts_")) {
+                            fields.insert(header.to_string(), val);
+                        }
+                        // Skip inserting sentinel values like i64::MAX
                     } else {
                         // Store as string if it can't be parsed as f64
                         string_fields.insert(header.to_string(), val_str.to_string());

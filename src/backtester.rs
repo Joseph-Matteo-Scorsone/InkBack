@@ -19,18 +19,37 @@ impl Position {
         exit_price: f64,
         costs: &TransactionCosts,
         avg_volume: f64,
+        is_options: bool,
     ) -> f64 {
         match self {
             Position::Long { entry, size, .. } => {
                 let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
                 let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
-                let gross_pnl = (exit_price - entry) * size;
+                
+                // Apply options multiplier only for options trading
+                let multiplier = if is_options { 100.0 } else { 1.0 };
+                let gross_pnl = (exit_price - entry) * size * multiplier;
+                
+                // Validate costs are finite - this is crucial
+                if !entry_cost.is_finite() || !exit_cost.is_finite() || !gross_pnl.is_finite() {
+                    println!("Warning: Non-finite values in PnL calculation");
+                    return 0.0; // Return 0 PnL if costs are infinite
+                }
+                
                 gross_pnl - entry_cost - exit_cost
             }
             Position::Short { entry, size, .. } => {
                 let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
                 let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
-                let gross_pnl = (entry - exit_price) * size;
+                
+                let multiplier = if is_options { 100.0 } else { 1.0 };
+                let gross_pnl = (entry - exit_price) * size * multiplier;
+                
+                if !entry_cost.is_finite() || !exit_cost.is_finite() || !gross_pnl.is_finite() {
+                    println!("Warning: Non-finite values in PnL calculation");
+                    return 0.0;
+                }
+                
                 gross_pnl - entry_cost - exit_cost
             }
             Position::Neutral => 0.0,
@@ -82,7 +101,11 @@ impl BacktestResult {
         trades: Vec<Trade>,
     ) -> Self {
         let total_return = ending_equity - starting_equity;
-        let total_return_pct = (ending_equity / starting_equity - 1.0) * 100.0;
+        let total_return_pct = if starting_equity == 0.0 { 
+            0.0 
+        } else { 
+            (ending_equity / starting_equity - 1.0) * 100.0 
+        };
         
         // Calculate max drawdown
         let mut peak = starting_equity;
@@ -112,7 +135,11 @@ impl BacktestResult {
         
         let gross_profit: f64 = trades.iter().filter(|t| t.pnl > 0.0).map(|t| t.pnl).sum();
         let gross_loss: f64 = trades.iter().filter(|t| t.pnl < 0.0).map(|t| t.pnl.abs()).sum();
-        let profit_factor = if gross_loss == 0.0 { if gross_profit > 0.0 { f64::INFINITY } else { 0.0 } } else { gross_profit / gross_loss };
+        let profit_factor = if gross_loss == 0.0 { 
+            if gross_profit > 0.0 { 1000.0 } else { 0.0 } // Cap at 1000 instead of infinity
+        } else { 
+            gross_profit / gross_loss 
+        };
         
         let avg_win = if winning_trades == 0 { 0.0 } else { gross_profit / winning_trades as f64 };
         let avg_loss = if losing_trades == 0 { 0.0 } else { gross_loss / losing_trades as f64 };
@@ -172,6 +199,7 @@ pub fn run_backtest_with_schema(
     let handler_schema = if let Some(ref custom_schema) = custom_schema {
         match custom_schema {
             InkBackSchema::FootPrint => Schema::Ohlcv1D, // FootPrint bars are stored as OHLCV format
+            InkBackSchema::CombinedOptionsUnderlying => Schema::Definition,
         }
     } else {
         schema
@@ -195,6 +223,11 @@ pub fn run_backtest_with_candles(
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
+    // Detect if we're trading options by checking for option-specific fields
+    let is_options_trading = candles.iter().any(|candle| 
+        candle.get_string("instrument_class").is_some() && 
+        candle.get("strike_price").is_some()
+    );
     let mut equity = starting_equity;
     let mut position = Position::Neutral;
     let mut prev_candle: Option<Candle> = None;
@@ -213,23 +246,52 @@ pub fn run_backtest_with_candles(
         if let Some(order) = pending_order.take() {
             match position {
                 Position::Neutral => {
-                    // Use the current candle's open price for entry
-                    let entry_price = candle.get("open")
+                    let _entry_price = candle.get("open")
                         .unwrap_or_else(|| candle.get("close")
                             .unwrap_or_else(|| candle.get("price")
                                 .unwrap_or(order.price)));
                     
-                    // Adjust entry price for slippage and spread
+                    let capital = equity * exposure;
+                    let size = if is_options_trading {
+                        // Use the order price for position sizing
+                        let option_notional_value = order.price * 100.0;
+                        (capital / option_notional_value).floor()
+                    } else {
+                        (capital / order.price).floor()
+                    };
+                    
                     let adjusted_entry_price = transaction_costs.adjust_fill_price(
-                        entry_price,
-                        0.0, // Size will be calculated below
+                        order.price,
+                        size,
                         avg_volume,
                         order.order_type == OrderType::Buy
                     );
                     
-                    let capital = equity * exposure;
-                    let size = capital / adjusted_entry_price;
-
+                    // Extract contract info for better logging
+                    let _contract_info = if is_options_trading {
+                        // Get contract details from the candle
+                        let instrument_class = candle.get_string("instrument_class").map(|s| s.as_str()).unwrap_or("UNK");
+                        let strike_price = candle.get("strike_price").unwrap_or(0.0);
+                        let symbol = candle.get_string("raw_symbol")
+                            .or_else(|| candle.get_string("symbol_def"))
+                            .or_else(|| candle.get_string("symbol"))
+                            .map(|s| s.as_str())
+                            .unwrap_or("UNKNOWN");
+                        
+                        let option_type = match instrument_class.chars().next().unwrap_or('U') {
+                            'C' => format!("C{:.0}", strike_price),
+                            'P' => format!("P{:.0}", strike_price),
+                            _ => "UNK".to_string(),
+                        };
+                        
+                        format!("{} {}", symbol, option_type)
+                    } else {
+                        "Stock".to_string()
+                    };
+                    
+                    //println!("BUYING {} at order price {:.2}, adjusted price {:.2}, size {}, equity ${:.0}", 
+                    //        contract_info, order.price, adjusted_entry_price, size, equity);
+                    
                     match order.order_type {
                         OrderType::Buy => {
                             position = Position::Long {
@@ -248,26 +310,62 @@ pub fn run_backtest_with_candles(
                     }
                 }
                 _ => {
-                    // This shouldn't happen - we should only have pending orders when neutral
                     println!("Warning: Pending order while already in position");
                 }
             }
         }
 
-        // Let the strategy decide what to do (entry OR exit)
-        // Strategy handles ALL trading logic including TP/SL
         if let Some(order) = strategy.on_candle(&candle, prev_candle.as_ref()) {
             match position {
                 // If we're in a position and get an order, it must be an exit
                 Position::Long { entry, size, ref entry_date } => {
                     if order.order_type == OrderType::Sell {
-                        let exit_price = order.price;
+                        let exit_price = transaction_costs.adjust_fill_price(
+                            order.price,
+                            size,
+                            avg_volume,
+                            false // selling, so we get worse price
+                        );
+                        
+                        // Extract contract info for better logging
+                        let _contract_info = if is_options_trading {
+                            let instrument_class = candle.get_string("instrument_class").map(|s| s.as_str()).unwrap_or("UNK");
+                            let strike_price = candle.get("strike_price").unwrap_or(0.0);
+                            let symbol = candle.get_string("raw_symbol")
+                                .or_else(|| candle.get_string("symbol_def"))
+                                .or_else(|| candle.get_string("symbol"))
+                                .map(|s| s.as_str())
+                                .unwrap_or("UNKNOWN");
+                            
+                            let option_type = match instrument_class.chars().next().unwrap_or('U') {
+                                'C' => format!("C{:.0}", strike_price),
+                                'P' => format!("P{:.0}", strike_price),
+                                _ => "UNK".to_string(),
+                            };
+                            
+                            format!("{} {}", symbol, option_type)
+                        } else {
+                            "Stock".to_string()
+                        };
+                        
+                        //println!("SELLING {} at order price {:.2}, adjusted price {:.2} (Entry: {:.2})", 
+                        //        contract_info, order.price, exit_price, entry);
                         
                         // Calculate PnL with transaction costs
-                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
-                        let gross_pnl = (exit_price - entry) * size;
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading);
+                        
+                        // Calculate gross PnL with appropriate multiplier
+                        let multiplier = if is_options_trading { 100.0 } else { 1.0 };
+                        let gross_pnl = (exit_price - entry) * size * multiplier;
                         let transaction_cost = gross_pnl - pnl;
 
+                        // Check what's causing infinite PnL
+                        if !pnl.is_finite() {
+                            println!("Debug Long: Infinite PnL - entry: {}, exit: {}, size: {}, gross_pnl: {}, pnl: {}", 
+                                entry, exit_price, size, gross_pnl, pnl);
+                            continue; // Skip adding this trade
+                        }
+                        
                         equity += pnl;
 
                         trades.push(Trade {
@@ -288,13 +386,52 @@ pub fn run_backtest_with_candles(
                 }
                 Position::Short { entry, size, ref entry_date } => {
                     if order.order_type == OrderType::Buy {
-                        let exit_price = order.price;
+                        let exit_price = transaction_costs.adjust_fill_price(
+                            order.price,
+                            size,
+                            avg_volume,
+                            true // buying to cover, so we get worse price
+                        );
+                        
+                        // Extract contract info for better logging
+                        let _contract_info = if is_options_trading {
+                            let instrument_class = candle.get_string("instrument_class").map(|s| s.as_str()).unwrap_or("UNK");
+                            let strike_price = candle.get("strike_price").unwrap_or(0.0);
+                            let symbol = candle.get_string("raw_symbol")
+                                .or_else(|| candle.get_string("symbol_def"))
+                                .or_else(|| candle.get_string("symbol"))
+                                .map(|s| s.as_str())
+                                .unwrap_or("UNKNOWN");
+                            
+                            let option_type = match instrument_class.chars().next().unwrap_or('U') {
+                                'C' => format!("C{:.0}", strike_price),
+                                'P' => format!("P{:.0}", strike_price),
+                                _ => "UNK".to_string(),
+                            };
+                            
+                            format!("{} {}", symbol, option_type)
+                        } else {
+                            "Stock".to_string()
+                        };
+                        
+                        //println!("COVERING {} at order price {:.2}, adjusted price {:.2} (Entry: {:.2})", 
+                        //        contract_info, order.price, exit_price, entry);
                         
                         // Calculate PnL with transaction costs
-                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume);
-                        let gross_pnl = (entry - exit_price) * size;
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading);
+                        
+                        // Calculate gross PnL with appropriate multiplier
+                        let multiplier = if is_options_trading { 100.0 } else { 1.0 };
+                        let gross_pnl = (entry - exit_price) * size * multiplier;
                         let transaction_cost = gross_pnl - pnl;
 
+                        // Check what could cause infinite PnL
+                        if !pnl.is_finite() {
+                            println!("Debug Short: Infinite PnL - entry: {}, exit: {}, size: {}, gross_pnl: {}, pnl: {}", 
+                                entry, exit_price, size, gross_pnl, pnl);
+                            continue; // Skip adding this trade
+                        }
+                        
                         equity += pnl;
 
                         trades.push(Trade {
@@ -320,7 +457,15 @@ pub fn run_backtest_with_candles(
             }
         }
 
-        equity_curve.push(equity);
+        // Ensure equity is finite before adding to curve
+        if equity.is_finite() {
+            equity_curve.push(equity);
+        } else {
+            // Use the last finite equity value
+            let last_equity = equity_curve.last().copied().unwrap_or(starting_equity);
+            equity_curve.push(last_equity);
+            equity = last_equity; // Reset equity to last valid value
+        }
         prev_candle = Some(candle.clone());
     }
 
@@ -363,6 +508,7 @@ pub fn calculate_benchmark_with_schema(
     let key = if let Some(ref custom_schema) = custom_schema {
         match custom_schema {
             InkBackSchema::FootPrint => "close", // FootPrint bars have OHLCV format
+            InkBackSchema::CombinedOptionsUnderlying => "underlying_ask", // for simplicity
         }
     } else {
         match schema {
@@ -419,7 +565,6 @@ pub fn calculate_benchmark_with_schema(
     ))
 }
 
-// Backward compatibility - keep the original function
 pub fn run_backtest(
     path: &str,
     schema: Schema,

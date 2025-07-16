@@ -188,7 +188,7 @@ impl<'a> canvas::Program<Message> for ChartRenderer<'a> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         
         // Chart margins
-        let margin = 40.0;
+        let margin = 80.0;
         let chart_bounds = Rectangle {
             x: margin,
             y: margin,

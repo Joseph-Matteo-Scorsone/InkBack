@@ -1,38 +1,193 @@
-# InkBack
+# InkBack by Scorsone Enterprises
 
-A historical back testing framework written in Rust with DataBento and Iced as the main dependencies.
-Users can define their own strategies and then run them in parallel and view the results in an Iced window along with the benchmark, which is whatever symbol you are back testing on.
+A high-performance historical backtesting framework written in Rust, designed for quantitative trading strategy development and analysis. Built with DataBento for market data and Iced for visualization.
 
-## Requirements
-- Rust
-    - Written with cargo 1.83.0 and rustc 1.83.0
-- Databento API key (set as environment variable `DATABENTO_API_KEY`)
-- Cargo
-- Internet connection for fetching market data
+## Features
 
-## Usage
+- **Multi-asset Support**: Equities, futures, and options backtesting
+- **Custom Strategy Development**: Implement your own trading strategies using the `Strategy` trait
+- **Parallel Processing**: Run multiple backtests concurrently with different parameter combinations
+- **Real-time Visualization**: Interactive equity curve plotting with Iced GUI
+- **Order Flow Analysis**: Built-in footprint imbalance detection and volume analysis
+- **Realistic Trading**: Includes slippage models, transaction costs, and order pending logic
+- **Data Management**: Automatic DataBento data fetching and CSV caching
+- **Risk Management**: Flexible position sizing and risk controls
 
-git clone the repo
-```https://github.com/Joseph-Matteo-Scorsone/InkBack.git```
-Then set your .env file and your DataBento API key in it as DATABENTO_API_KEY.
+## Architecture
 
-I designed this so that way users can make thier own struct and then impl Strategy for it. The default that it comes with is an order flow footprint imbalance detector.
-That is what you should delete to make your own strategy.
+InkBack follows a modular design:
 
-There needs to be an on_candle method to be called by the back tester.
-on_candle needs a candle and for convenience accepts the previous candle as well so you have both.
+- **Strategy**: Define custom trading logic by implementing the `Strategy` trait
+- **Backtester**: Core engine that processes historical data and executes strategies
+- **Data Handler**: Manages DataBento integration and local data storage
+- **Visualization**: Real-time equity curve plotting and performance metrics
 
-Risk is handled by the user, I didn't want to restrict the back tester to only fixed take profit and stop loss.
-In on_candle update your indicators and what not, model your orders, and check for risk.
+## Prerequisites
 
-By design when you request a dataset from DataBento it will check if you already have it, if you don't it will get the data and save it as a csv.
-I handle the 9th exponent compression in saving to the csv, it doesn't matter for the back tests.
+- **Rust**: Version 1.83.0 or higher
+- **DataBento API Key**: Professional market data access
+- **Dependencies**: Managed automatically via Cargo
 
-Multiple DataBento Schemas and datasets are supported by this framework.
+## Quick Start
 
-It comes as is to support back tests in parallel, users can define windows of parameters, gather every parameter combination and then run tests with each in parallel. Slippage and fees are also calculated per trade. Orders pend, they are not filled on the candle you calculated your edge on's close.
+### 1. Clone and Setup
 
-Every run also shows an Iced window with the equity curves for every back test as well as a back test for how just holding the benchmark would do.
+```bash
+git clone https://github.com/Joseph-Matteo-Scorsone/InkBack.git
+cd InkBack
+```
+
+### 2. Configure Environment
+
+Create a `.env` file in the project root:
+
+```env
+DATABENTO_API_KEY=your_databento_api_key_here
+```
+
+### 3. Run Examples
+
+```bash
+# Footprint volume imbalance strategy
+cargo run --bin footprint_example
+
+# Options momentum strategy  
+cargo run --bin options_example
+
+# Futures strategy
+cargo run --bin futures_example
+
+# Equities strategy
+cargo run --bin equities_example
+```
+
+## Creating Custom Strategies
+
+### Basic Strategy Implementation
+
+```rust
+use crate::strategy::{Strategy, Candle, Order, OrderType};
+
+pub struct MyStrategy {
+    // Your strategy parameters and state
+}
+
+impl Strategy for MyStrategy {
+    fn on_candle(&mut self, candle: &Candle, prev: Option<&Candle>) -> Option<Order> {
+        // Implement your trading logic here
+        // Return Some(Order) to place an order, None to do nothing
+        
+        let close_price = candle.get("close")?;
+        
+        // Example: Simple momentum strategy
+        if let Some(prev_candle) = prev {
+            let prev_close = prev_candle.get("close")?;
+            if close_price > prev_close * 1.01 {
+                return Some(Order {
+                    order_type: OrderType::Buy,
+                    price: close_price,
+                });
+            }
+        }
+        
+        None
+    }
+}
+```
+
+### Accessing Market Data
+
+The `Candle` struct provides access to all market data fields:
+
+```rust
+// Numeric fields (OHLCV, etc.)
+let close = candle.get("close")?;
+let volume = candle.get("volume")?;
+let high = candle.get("high")?;
+
+// String fields (symbols, footprint data, etc.)
+let symbol = candle.get_string("symbol")?;
+let footprint = candle.get_string("footprint_data")?;
+```
+
+## Data Sources
+
+InkBack supports multiple DataBento schemas:
+
+- **FootPrint**: Order flow and volume profile data
+- **CombinedOptionsUnderlying**: Options chains with underlying data
+- **OHLCV**: Traditional candlestick data
+- **Trades**: Tick-by-tick trade data
+
+## Configuration
+
+### Slippage Models
+
+Configure realistic transaction costs:
+
+```rust
+use crate::slippage_models::{TransactionCosts, LinearSlippage};
+
+let costs = TransactionCosts {
+    fixed_fee: 0.50,
+    percentage_fee: 0.001,
+    slippage: Box::new(LinearSlippage::new(0.0001)),
+};
+```
+
+### Parameter Optimization
+
+Run parameter sweeps for strategy optimization:
+
+```rust
+let param_ranges = vec![
+    (10..=50).step_by(10).collect(), // lookback periods
+    (0.01..=0.05).step_by(0.01).collect(), // thresholds
+];
+
+// Generate all combinations and run in parallel
+let results = param_ranges
+    .into_par_iter()
+    .map(|params| run_backtest(params))
+    .collect();
+```
+
+## Performance Metrics
+
+InkBack automatically calculates:
+
+- Total return and annualized return
+- Sharpe ratio and maximum drawdown
+- Win rate and profit factor
+- Average trade duration
+- Risk-adjusted metrics
+
+## Data Management
+
+- **Automatic Caching**: Downloaded data is saved locally as CSV
+- **Compression Handling**: Automatic decompression of DataBento's 9th exponent format
+- **Incremental Updates**: Only fetch new data when needed
+- **Multiple Timeframes**: Support for various data frequencies
+
+## Examples
+
+The `examples/` directory contains complete implementations:
+
+- **Footprint Strategy**: Volume imbalance detection using order flow
+- **Options Momentum**: Momentum-based options trading
+- **Futures Strategy**: Trend-following futures system
+- **Equities Strategy**: Mean reversion equity strategy
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Implement your changes with tests
+4. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 # DISCLAIMER
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Candle {
     /// The primary column
     pub date: String,
@@ -10,6 +11,7 @@ pub struct Candle {
     pub string_fields: HashMap<String, String>,
 }
 
+#[allow(dead_code)]
 impl Candle {
     /// Look up a numeric column by name (e.g. `"close"`).
     pub fn get(&self, key: &str) -> Option<f64> {
