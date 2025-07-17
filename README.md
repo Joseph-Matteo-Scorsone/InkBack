@@ -49,16 +49,16 @@ DATABENTO_API_KEY=your_databento_api_key_here
 
 ```bash
 # Footprint volume imbalance strategy
-cargo run --bin footprint_example
+examples/footprint/footprint_example.rs
 
 # Options momentum strategy  
-cargo run --bin options_example
+examples/options/options_example.rs
 
 # Futures strategy
-cargo run --bin futures_example
+examples/futures/futures_example.rs
 
 # Equities strategy
-cargo run --bin equities_example
+examples/equities/equities_example.rs
 ```
 
 ## Creating Custom Strategies
