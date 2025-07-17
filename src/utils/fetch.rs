@@ -276,11 +276,15 @@ pub async fn fetch_and_save_csv(
             let mut underlying_data = Vec::new();
             while let Some(mbp1) = underlying_decoder.decode_record::<Mbp1Msg>().await? {
                 let level = &mbp1.levels[0];
-                underlying_data.push((
-                    mbp1.hd.ts_event,
-                    (level.bid_px as f64) * scaling_factor,
-                    (level.ask_px as f64) * scaling_factor,
-                ));
+                let bid_price = (level.bid_px as f64) * scaling_factor;
+                let ask_price = (level.ask_px as f64) * scaling_factor;
+                
+                // Filter out invalid/sentinel values - typically huge numbers indicating missing data
+                if bid_price.is_finite() && ask_price.is_finite() && 
+                   bid_price > 0.0 && ask_price > 0.0 && 
+                   bid_price < 1e7 && ask_price < 1e7 {
+                    underlying_data.push((mbp1.hd.ts_event, bid_price, ask_price));
+                }
             }
 
             println!("Collected {} underlying data points", underlying_data.len());
@@ -745,7 +749,7 @@ pub async fn fetch_and_save_csv(
 
 // Helper function to find most recent underlying data (equivalent to merge_asof)
 fn find_most_recent_underlying(underlying_data: &[(u64, f64, f64)], target_time: u64) -> (f64, f64) {
-    match underlying_data.binary_search_by_key(&target_time, |&(ts, _, _)| ts) {
+    let (bid, ask) = match underlying_data.binary_search_by_key(&target_time, |&(ts, _, _)| ts) {
         Ok(index) => (underlying_data[index].1, underlying_data[index].2),
         Err(index) => {
             if index == 0 {
@@ -754,6 +758,14 @@ fn find_most_recent_underlying(underlying_data: &[(u64, f64, f64)], target_time:
                 (underlying_data[index - 1].1, underlying_data[index - 1].2)
             }
         }
+    };
+    
+    // Additional safety check for invalid values that might have slipped through
+    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && bid < 1e7 && ask < 1e7 {
+        (bid, ask)
+    } else {
+        // Return reasonable fallback or previous good value
+        (0.0, 0.0)
     }
 }
 
