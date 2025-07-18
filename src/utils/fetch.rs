@@ -278,19 +278,23 @@ pub async fn fetch_and_save_csv(
                 let level = &mbp1.levels[0];
                 let bid_price = (level.bid_px as f64) * scaling_factor;
                 let ask_price = (level.ask_px as f64) * scaling_factor;
+                let bid_size = level.bid_sz as f64;
+                let ask_size = level.ask_sz as f64;
                 
                 // Filter out invalid/sentinel values - typically huge numbers indicating missing data
                 if bid_price.is_finite() && ask_price.is_finite() && 
                    bid_price > 0.0 && ask_price > 0.0 && 
-                   bid_price < 1e7 && ask_price < 1e7 {
-                    underlying_data.push((mbp1.hd.ts_event, bid_price, ask_price));
+                   bid_price < 1e7 && ask_price < 1e7 &&
+                   bid_size > 0.0 && ask_size > 0.0 && 
+                   bid_size < 1e7 && ask_size < 1e7 {
+                    underlying_data.push((mbp1.hd.ts_event, bid_price, ask_price, bid_size, ask_size));
                 }
             }
 
             println!("Collected {} underlying data points", underlying_data.len());
 
             // Sort underlying data by timestamp for binary search
-            underlying_data.sort_by_key(|&(ts, _, _)| ts);
+            underlying_data.sort_by_key(|&(ts, _, _, _, _)| ts);
 
             // Batch option trades requests
             println!("Fetching option trades in batches...");
@@ -321,7 +325,7 @@ pub async fn fetch_and_save_csv(
                 "settl_price_type", "sub_fraction", "underlying_product", "maturity_month", 
                 "maturity_day", "maturity_week",
                 "contract_multiplier_unit", "flow_schedule_type", "tick_rule", "symbol_def", 
-                "underlying_bid", "underlying_ask"
+                "underlying_bid", "underlying_ask", "underlying_bid_size", "underlying_ask_size"
             ])?;
 
             // Process option IDs in batches
@@ -346,7 +350,7 @@ pub async fn fetch_and_save_csv(
                 while let Some(trade) = opt_trades_decoder.decode_record::<TradeMsg>().await? {
                     if let Some(definition) = option_definitions.get(&trade.hd.instrument_id) {
                         // Find most recent underlying data
-                        let (underlying_bid, underlying_ask) = find_most_recent_underlying(&underlying_data, trade.ts_recv);
+                        let (underlying_bid, underlying_ask, underlying_bid_size, underlying_ask_size) = find_most_recent_underlying(&underlying_data, trade.ts_recv);
 
                         // Create symbol_def from raw_symbol
                         let symbol_def = i8_array_to_string(&definition.raw_symbol);
@@ -429,6 +433,8 @@ pub async fn fetch_and_save_csv(
                             symbol_def,
                             underlying_bid.to_string(),
                             underlying_ask.to_string(),
+                            underlying_bid_size.to_string(),
+                            underlying_ask_size.to_string(),
                         ])?;
 
                         trades_processed += 1;
@@ -748,24 +754,25 @@ pub async fn fetch_and_save_csv(
 }
 
 // Helper function to find most recent underlying data (equivalent to merge_asof)
-fn find_most_recent_underlying(underlying_data: &[(u64, f64, f64)], target_time: u64) -> (f64, f64) {
-    let (bid, ask) = match underlying_data.binary_search_by_key(&target_time, |&(ts, _, _)| ts) {
-        Ok(index) => (underlying_data[index].1, underlying_data[index].2),
+fn find_most_recent_underlying(underlying_data: &[(u64, f64, f64, f64, f64)], target_time: u64) -> (f64, f64, f64, f64) {
+    let (bid, ask, bid_size, ask_size) = match underlying_data.binary_search_by_key(&target_time, |&(ts, _, _, _, _)| ts) {
+        Ok(index) => (underlying_data[index].1, underlying_data[index].2, underlying_data[index].3, underlying_data[index].4),
         Err(index) => {
             if index == 0 {
-                (0.0, 0.0) // No data before this time
+                (0.0, 0.0, 0.0, 0.0) // No data before this time
             } else {
-                (underlying_data[index - 1].1, underlying_data[index - 1].2)
+                (underlying_data[index - 1].1, underlying_data[index - 1].2, underlying_data[index - 1].3, underlying_data[index - 1].4)
             }
         }
     };
     
     // Additional safety check for invalid values that might have slipped through
-    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && bid < 1e7 && ask < 1e7 {
-        (bid, ask)
+    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && bid < 1e7 && ask < 1e7 &&
+       bid_size.is_finite() && ask_size.is_finite() && bid_size >= 0.0 && ask_size >= 0.0 && bid_size < 1e7 && ask_size < 1e7 {
+        (bid, ask, bid_size, ask_size)
     } else {
         // Return reasonable fallback or previous good value
-        (0.0, 0.0)
+        (0.0, 0.0, 0.0, 0.0)
     }
 }
 

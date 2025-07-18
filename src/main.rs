@@ -370,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Define historical data range
     let start = date!(2025 - 06 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2025 - 07 - 11).with_time(time!(00:00)).assume_utc();
+    let end = date!(2025 - 06 - 30).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
     let exposure = 0.10; // % of the account to put on each trade.
