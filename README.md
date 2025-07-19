@@ -180,7 +180,7 @@ The `examples/` directory contains complete implementations:
 
 ## Output
 
-![alt text](https://pbs.twimg.com/media/GwKiukOW8AAuPx9?format=jpg&name=900x900)
+![alt text](https://pbs.twimg.com/media/GwL7McvWgAAmqJa?format=png&name=large)
 
 ## Contributing
 
