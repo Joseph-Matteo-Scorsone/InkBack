@@ -178,6 +178,10 @@ The `examples/` directory contains complete implementations:
 - **Futures Strategy**: Trend-following futures system
 - **Equities Strategy**: Mean reversion equity strategy
 
+## Output
+
+![alt text](https://pbs.twimg.com/media/GwKiukOW8AAuPx9?format=jpg&name=900x900)
+
 ## Contributing
 
 1. Fork the repository
