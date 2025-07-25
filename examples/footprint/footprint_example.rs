@@ -167,30 +167,32 @@ impl Strategy for FootprintVolumeImbalance {
         // If in a position, check TP/SL
         if let (Some(position), Some(entry)) = (self.current_position, self.entry_price) {
             match position {
-                OrderType::Buy => {
-                    if close >= entry * (1.0 + self.tp) || close <= entry * (1.0 - self.sl) {
-                        //println!("Exiting BUY position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
-                        //        close, entry, entry * (1.0 + self.tp), entry * (1.0 - self.sl));
-                        self.current_position = None;
-                        self.entry_price = None;
-                        return Some(Order {
-                            order_type: OrderType::Sell,
-                            price: close,
-                        });
-                    }
-                }
-                OrderType::Sell => {
-                    if close <= entry * (1.0 - self.tp) || close >= entry * (1.0 + self.sl) {
-                        //println!("Exiting SELL position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
-                        //        close, entry, entry * (1.0 - self.tp), entry * (1.0 + self.sl));
-                        self.current_position = None;
-                        self.entry_price = None;
-                        return Some(Order {
-                            order_type: OrderType::Buy,
-                            price: close,
-                        });
-                    }
-                }
+                OrderType::MarketBuy => {
+                                if close >= entry * (1.0 + self.tp) || close <= entry * (1.0 - self.sl) {
+                                    //println!("Exiting BUY position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
+                                    //        close, entry, entry * (1.0 + self.tp), entry * (1.0 - self.sl));
+                                    self.current_position = None;
+                                    self.entry_price = None;
+                                    return Some(Order {
+                                        order_type: OrderType::MarketSell,
+                                        price: close,
+                                    });
+                                }
+                            }
+                OrderType::MarketSell => {
+                                if close <= entry * (1.0 - self.tp) || close >= entry * (1.0 + self.sl) {
+                                    //println!("Exiting SELL position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
+                                    //        close, entry, entry * (1.0 - self.tp), entry * (1.0 + self.sl));
+                                    self.current_position = None;
+                                    self.entry_price = None;
+                                    return Some(Order {
+                                        order_type: OrderType::MarketBuy,
+                                        price: close,
+                                    });
+                                }
+                            }
+                OrderType::LimitBuy => todo!(),
+                OrderType::LimitSell => todo!(),
             }
         }
 
@@ -233,11 +235,11 @@ impl Strategy for FootprintVolumeImbalance {
         let new_signal = if current_imbalance > self.imbalance_threshold && avg_imbalance > 0.0 {
             //println!("BUY signal: current_imbalance={:.4} > threshold={:.4} && avg_imbalance={:.4} > 0", 
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);
-            Some(OrderType::Buy)
+            Some(OrderType::MarketBuy)
         } else if current_imbalance < -self.imbalance_threshold && avg_imbalance < 0.0 {
             //println!("SELL signal: current_imbalance={:.4} < -{:.4} && avg_imbalance={:.4} < 0", 
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);
-            Some(OrderType::Sell)
+            Some(OrderType::MarketSell)
         } else {
             //println!("No signal: current_imbalance={:.4}, threshold={:.4}, avg_imbalance={:.4}", 
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);

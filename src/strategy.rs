@@ -29,12 +29,15 @@ pub trait Strategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum OrderType {
-    Buy,
-    Sell,
+    MarketBuy,
+    MarketSell,
+    LimitBuy,
+    LimitSell,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Order {
     pub order_type: OrderType,
     pub price: f64,

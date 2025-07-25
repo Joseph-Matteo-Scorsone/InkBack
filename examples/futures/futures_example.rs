@@ -162,12 +162,12 @@ impl MovingAverageCrossStrategy {
 
         // Golden Cross: Short MA crosses above Long MA (bullish signal)
         if self.prev_short_ma <= self.prev_long_ma && self.short_ma > self.long_ma {
-            return Some(OrderType::Buy);
+            return Some(OrderType::MarketBuy);
         }
         
         // Death Cross: Short MA crosses below Long MA (bearish signal)
         if self.prev_short_ma >= self.prev_long_ma && self.short_ma < self.long_ma {
-            return Some(OrderType::Sell);
+            return Some(OrderType::MarketSell);
         }
         
         None
@@ -258,8 +258,8 @@ impl Strategy for MovingAverageCrossStrategy {
         if self.position_state != PositionState::Flat {
             if self.should_exit_position(current_price) {
                 let exit_order = match self.position_state {
-                    PositionState::Long => OrderType::Sell,
-                    PositionState::Short => OrderType::Buy,
+                    PositionState::Long => OrderType::MarketSell,
+                    PositionState::Short => OrderType::MarketBuy,
                     PositionState::Flat => return None,
                 };
                 
@@ -277,15 +277,15 @@ impl Strategy for MovingAverageCrossStrategy {
             // Check for opposite crossover signal to close position
             if let Some(signal) = self.check_crossover_signal() {
                 let should_close = match (self.position_state, signal) {
-                    (PositionState::Long, OrderType::Sell) => true,
-                    (PositionState::Short, OrderType::Buy) => true,
+                    (PositionState::Long, OrderType::MarketSell) => true,
+                    (PositionState::Short, OrderType::MarketBuy) => true,
                     _ => false,
                 };
                 
                 if should_close {
                     let exit_order = match self.position_state {
-                        PositionState::Long => OrderType::Sell,
-                        PositionState::Short => OrderType::Buy,
+                        PositionState::Long => OrderType::MarketSell,
+                        PositionState::Short => OrderType::MarketBuy,
                         PositionState::Flat => return None,
                     };
                     
@@ -313,8 +313,10 @@ impl Strategy for MovingAverageCrossStrategy {
             
             // Update position state
             self.position_state = match signal {
-                OrderType::Buy => PositionState::Long,
-                OrderType::Sell => PositionState::Short,
+                OrderType::MarketBuy => PositionState::Long,
+                OrderType::MarketSell => PositionState::Short,
+                OrderType::LimitBuy => todo!(),
+                OrderType::LimitSell => todo!(),
             };
             self.entry_price = current_price;
             self.entry_time = candle.date.clone();

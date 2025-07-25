@@ -220,7 +220,7 @@ impl OptionsMomentumStrategy {
                 if momentum > self.momentum_threshold {
                     // Focus on near-the-money options for better delta exposure
                     if moneyness >= 0.90 && moneyness <= 1.10 { // 10% ITM to 10% OTM
-                        Some(OrderType::Buy)
+                        Some(OrderType::MarketBuy)
                     } else {
                         None
                     }
@@ -241,7 +241,7 @@ impl OptionsMomentumStrategy {
                 if momentum < -self.momentum_threshold {
                     // Focus on near-the-money options for better delta exposure
                     if moneyness >= 0.90 && moneyness <= 1.10 { // 10% ITM to 10% OTM
-                        Some(OrderType::Buy)
+                        Some(OrderType::MarketBuy)
                     } else {
                         None
                     }
@@ -315,7 +315,7 @@ impl Strategy for OptionsMomentumStrategy {
                             self.current_contract = None;
                             
                             return Some(Order {
-                                order_type: OrderType::Sell,
+                                order_type: OrderType::MarketSell,
                                 price: option_price,
                             });
                         }
@@ -347,8 +347,10 @@ impl Strategy for OptionsMomentumStrategy {
                 
                 // Update position state
                 self.position_state = match order_type {
-                    OrderType::Buy => PositionState::Long,
-                    OrderType::Sell => PositionState::Short,
+                    OrderType::MarketBuy => PositionState::Long,
+                    OrderType::MarketSell => PositionState::Short,
+                    OrderType::LimitBuy => todo!(),
+                    OrderType::LimitSell => todo!(),
                 };
                 self.current_contract = Some(contract_info);
                 
@@ -552,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         
         // Limit the number of curves plotted to avoid clutter
-        let max_curves = 50; // Adjust this value based on visualization needs
+        let max_curves = 20; // Adjust this value based on visualization needs
         let curves_to_plot = if equity_curves.len() > max_curves {
             println!("Too many equity curves ({}), plotting only the top {} strategies.", 
                 equity_curves.len(), max_curves);

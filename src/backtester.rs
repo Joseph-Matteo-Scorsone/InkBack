@@ -185,6 +185,18 @@ fn calculate_average_volume(candles: &[Candle]) -> f64 {
     }
 }
 
+// Helper function to check if a limit order should be filled based on current candle
+fn should_fill_limit_order(order: &Order, candle: &Candle) -> bool {
+    let high = candle.get("high").unwrap_or_else(|| candle.get("price").unwrap_or(order.price));
+    let low = candle.get("low").unwrap_or_else(|| candle.get("price").unwrap_or(order.price));
+    
+    match order.order_type {
+        OrderType::LimitBuy => low <= order.price,  // Fill if price drops to or below limit price
+        OrderType::LimitSell => high >= order.price, // Fill if price rises to or above limit price
+        _ => false, // Not a limit order
+    }
+}
+
 // Generic function that works with any schema
 pub fn run_backtest_with_schema(
     csv_path: &str,
@@ -234,6 +246,7 @@ pub fn run_backtest_with_candles(
     let mut trades = Vec::new();
     let mut equity_curve = Vec::new();
     let mut pending_order: Option<Order> = None; // Store orders for next candle
+    let mut pending_limit_orders: Vec<Order> = Vec::new(); // Store limit orders until filled or cancelled
 
     // Calculate average volume for transaction cost calculations
     let avg_volume = calculate_average_volume(&candles);
@@ -242,7 +255,56 @@ pub fn run_backtest_with_candles(
     equity_curve.push(starting_equity);
 
     for candle in candles.iter() {
-        // First, execute any pending order from the previous candle
+        //  check if any pending limit orders should be filled
+        let mut filled_limit_orders = Vec::new();
+        pending_limit_orders.retain(|order| {
+            if should_fill_limit_order(order, candle) {
+                filled_limit_orders.push(*order);
+                false // Remove from pending orders
+            } else {
+                true // Keep in pending orders
+            }
+        });
+        
+        // Process filled limit orders (only process the first one if multiple are filled)
+        if let Some(order) = filled_limit_orders.first() {
+            if matches!(position, Position::Neutral) {
+                let capital = equity * exposure;
+                let size = if is_options_trading {
+                    let option_notional_value = order.price * 100.0;
+                    (capital / option_notional_value).floor()
+                } else {
+                    (capital / order.price).floor()
+                };
+                
+                let adjusted_entry_price = transaction_costs.adjust_fill_price(
+                    order.price,
+                    size,
+                    avg_volume,
+                    matches!(order.order_type, OrderType::LimitBuy)
+                );
+                
+                match order.order_type {
+                    OrderType::LimitBuy => {
+                        position = Position::Long {
+                            entry: adjusted_entry_price,
+                            size,
+                            entry_date: candle.date.clone(),
+                        };
+                    }
+                    OrderType::LimitSell => {
+                        position = Position::Short {
+                            entry: adjusted_entry_price,
+                            size,
+                            entry_date: candle.date.clone(),
+                        };
+                    }
+                    _ => {} // Should not happen for limit orders
+                }
+            }
+        }
+        
+        // Then, execute any pending market order from the previous candle
         if let Some(order) = pending_order.take() {
             match position {
                 Position::Neutral => {
@@ -264,7 +326,7 @@ pub fn run_backtest_with_candles(
                         order.price,
                         size,
                         avg_volume,
-                        order.order_type == OrderType::Buy
+                        order.order_type == OrderType::MarketBuy
                     );
                     
                     // Extract contract info for better logging
@@ -293,20 +355,21 @@ pub fn run_backtest_with_candles(
                     //        contract_info, order.price, adjusted_entry_price, size, equity);
                     
                     match order.order_type {
-                        OrderType::Buy => {
+                        OrderType::MarketBuy => {
                             position = Position::Long {
                                 entry: adjusted_entry_price,
                                 size,
                                 entry_date: candle.date.clone(),
                             };
                         }
-                        OrderType::Sell => {
+                        OrderType::MarketSell => {
                             position = Position::Short {
                                 entry: adjusted_entry_price,
                                 size,
                                 entry_date: candle.date.clone(),
                             };
                         }
+                        _ => {} // Limit orders handled above
                     }
                 }
                 _ => {
@@ -319,7 +382,7 @@ pub fn run_backtest_with_candles(
             match position {
                 // If we're in a position and get an order, it must be an exit
                 Position::Long { entry, size, ref entry_date } => {
-                    if order.order_type == OrderType::Sell {
+                    if order.order_type == OrderType::MarketSell {
                         let exit_price = transaction_costs.adjust_fill_price(
                             order.price,
                             size,
@@ -385,7 +448,7 @@ pub fn run_backtest_with_candles(
                     }
                 }
                 Position::Short { entry, size, ref entry_date } => {
-                    if order.order_type == OrderType::Buy {
+                    if order.order_type == OrderType::MarketBuy {
                         let exit_price = transaction_costs.adjust_fill_price(
                             order.price,
                             size,
@@ -450,9 +513,18 @@ pub fn run_backtest_with_candles(
                         position = Position::Neutral;
                     }
                 }
-                // If we're neutral and get an order, it's a new entry (store for next candle)
+                // If we're neutral and get an order, it's a new entry
                 Position::Neutral => {
-                    pending_order = Some(order);
+                    match order.order_type {
+                        OrderType::MarketBuy | OrderType::MarketSell => {
+                            // Market orders are executed next candle
+                            pending_order = Some(order);
+                        }
+                        OrderType::LimitBuy | OrderType::LimitSell => {
+                            // Limit orders are added to pending limit orders queue
+                            pending_limit_orders.push(order);
+                        }
+                    }
                 }
             }
         }
