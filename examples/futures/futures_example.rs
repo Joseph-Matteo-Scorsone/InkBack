@@ -1,5 +1,4 @@
 use std::{collections::VecDeque, usize};
-use rayon::prelude::*;
 use time::{macros::date, macros::time};
 use databento::{
     dbn::{Schema},
@@ -13,12 +12,12 @@ mod backtester;
 mod plot;
 pub mod slippage_models;
 
-use plot::plot_equity_curves;
 use strategy::Strategy;
 use utils::fetch::fetch_and_save_csv;
-use crate::{slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
+use crate::{backtester::{display_results, run_parallel_backtest}, slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
 
 // InkBack schemas
+#[derive(Clone)]
 pub enum InkBackSchema {
     FootPrint,
     CombinedOptionsUnderlying,
@@ -348,33 +347,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Fetch data
     let schema = Schema::Ohlcv1H; // or Schema::Ohlcv1M for minute bars
+    let symbol = "NQ.v.0";
     let csv_path = fetch_and_save_csv(
         client, 
         "GLBX.MDP3",        // Futures dataset
-        "NQ.c.0",           // NQ future
+        symbol,           // NQ future
         None,               // No options data needed
         schema, 
         None,               // No custom schema needed
         start, 
         end
     ).await?;
-
-    println!("Data saved to: {}", csv_path);
-
-    // Run benchmark
-    let benchmark = backtester::calculate_benchmark(
-        &csv_path, 
-        schema, 
-        None,
-        starting_equity, 
-        exposure
-    )?;
-    
-    println!("Benchmark (Buy & Hold) Return: {:.2}%, Max Drawdown: {:.2}%", 
-        benchmark.total_return_pct, benchmark.max_drawdown_pct);
-
-    // Store equity curves for plotting
-    let mut equity_curves: Vec<(String, Vec<f64>)> = Vec::new();
 
     // Set transaction costs for futures trading
     let nq_tick_size = 0.25;
@@ -409,129 +392,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("Testing {} parameter combinations...", parameter_combinations.len());
+    let sorted_results = run_parallel_backtest(
+        parameter_combinations,
+        &csv_path,
+        &symbol,
+        schema,
+        None,
+        |params| Ok(Box::new(MovingAverageCrossStrategy::new(params)?)),
+        starting_equity,
+        exposure,
+        transaction_costs.clone(),
+    );
 
-    // Run backtests in parallel
-    let results: Vec<_> = parameter_combinations
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, params)| {
-            // Create a fresh strategy instance for each parameter set
-            let mut strategy = MovingAverageCrossStrategy::new(params).ok()?;
-
-            println!("Testing strategy {} with params: {:?}", index + 1, params);
-
-            let result = backtester::run_backtest(
-                &csv_path,
-                schema,
-                None,
-                &mut strategy,
-                starting_equity,
-                exposure,
-                transaction_costs.clone(),
-            ).ok()?;
-
-            // Validate equity curve has reasonable values
-            if result.equity_curve.iter().any(|&val| !val.is_finite()) {
-                println!("Warning: Strategy {} has non-finite equity values", index + 1);
-                return None;
-            }
-
-            // Create parameter label
-            let param_str = format!(
-                "MA_Cross_{}_{}_Vol({:.1})_TP({:.0}%)_SL({:.0}%)",
-                params.get("short_ma_period").unwrap_or(0.0) as usize,
-                params.get("long_ma_period").unwrap_or(0.0) as usize,
-                params.get("volume_threshold").unwrap_or(0.0),
-                params.get("profit_target").unwrap_or(0.0),
-                params.get("stop_loss").unwrap_or(0.0),
-            );
-
-            // Store equity curve with validation
-            let finite_curve: Vec<f64> = result.equity_curve.iter()
-                .map(|&val| if val.is_finite() { val } else { starting_equity })
-                .collect();
-            
-            Some((param_str, result, finite_curve))
-        })
-        .collect();
-
-    // Sort results by total return
-    let mut sorted_results = results;
-    sorted_results.sort_by(|a, b| b.1.total_return_pct.partial_cmp(&a.1.total_return_pct).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Print results for all strategies
-    println!("\n=== ALL STRATEGY RESULTS ===");
-    println!("Benchmark (Buy & Hold): Return {:.2}%, Max DD: {:.2}%\n", 
-        benchmark.total_return_pct, benchmark.max_drawdown_pct);
-
-    for (i, (param_str, result, _)) in sorted_results.iter().enumerate() {
-        println!(
-            "{}. {}: Return: {:.2}%, Max DD: {:.2}%, Win Rate: {:.1}%, PF: {:.2}, Trades: {}, Fees: ${:.0}",
-            i + 1,
-            param_str,
-            if result.total_return_pct.is_finite() { result.total_return_pct } else { 0.0 },
-            if result.max_drawdown_pct.is_finite() { result.max_drawdown_pct } else { 0.0 },
-            if result.win_rate.is_finite() { result.win_rate } else { 0.0 },
-            if result.profit_factor.is_finite() { result.profit_factor } else { 0.0 },
-            result.total_trades,
-            if result.total_transaction_costs.is_finite() { result.total_transaction_costs } else { 0.0 }
-        );
-
-        // Store equity curve for plotting
-        equity_curves.push((param_str.clone(), sorted_results[i].2.clone()));
-    }
-
-    // Print summary statistics
-    if !sorted_results.is_empty() {
-        let profitable_strategies = sorted_results.iter()
-            .filter(|(_, result, _)| result.total_return_pct > 0.0)
-            .count();
-        
-        let avg_return: f64 = sorted_results.iter()
-            .map(|(_, result, _)| result.total_return_pct)
-            .sum::<f64>() / sorted_results.len() as f64;
-        
-        let best_return = sorted_results.first().map(|(_, result, _)| result.total_return_pct).unwrap_or(0.0);
-        let worst_return = sorted_results.last().map(|(_, result, _)| result.total_return_pct).unwrap_or(0.0);
-
-        println!("\n=== SUMMARY STATISTICS ===");
-        println!("Total strategies tested: {}", sorted_results.len());
-        println!("Profitable strategies: {} ({:.1}%)", 
-            profitable_strategies, 
-            (profitable_strategies as f64 / sorted_results.len() as f64) * 100.0);
-        println!("Average return: {:.2}%", avg_return);
-        println!("Best return: {:.2}%", best_return);
-        println!("Worst return: {:.2}%", worst_return);
-        println!("Benchmark return: {:.2}%", benchmark.total_return_pct);
-        
-        let outperforming = sorted_results.iter()
-            .filter(|(_, result, _)| result.total_return_pct > benchmark.total_return_pct)
-            .count();
-        println!("Strategies beating benchmark: {} ({:.1}%)", 
-            outperforming,
-            (outperforming as f64 / sorted_results.len() as f64) * 100.0);
-    }
-
-    // Plot equity curves
-    if !equity_curves.is_empty() {
-        println!("\nLaunching performance chart for all strategies...");
-        let finite_benchmark: Vec<f64> = benchmark.equity_curve.iter()
-            .map(|&val| if val.is_finite() { val } else { starting_equity })
-            .collect();
-        
-        // Limit the number of curves plotted to avoid clutter
-        let max_curves = 20;
-        let curves_to_plot = if equity_curves.len() > max_curves {
-            println!("Too many equity curves ({}), plotting only the top {} strategies.", 
-                equity_curves.len(), max_curves);
-            equity_curves.into_iter().take(max_curves).collect()
-        } else {
-            equity_curves
-        };
-
-        plot_equity_curves(curves_to_plot, Some(finite_benchmark));
-    }
+    display_results(sorted_results, &csv_path, &symbol, schema, None, starting_equity, exposure);
 
     Ok(())
 }

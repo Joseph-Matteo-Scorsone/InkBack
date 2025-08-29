@@ -1,6 +1,7 @@
-use crate::{strategy::{Candle, Order, OrderType, Strategy}, InkBackSchema};
+use crate::{plot::plot_equity_curves, strategy::{Candle, Order, OrderType, Strategy, StrategyParams}, InkBackSchema};
 use crate::slippage_models::TransactionCosts;
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use databento::dbn::Schema;
 
@@ -13,6 +14,44 @@ enum Position {
     Neutral,
 }
 
+enum FutureTraded {
+    NQ,
+    ES,
+    YM,
+    CL,
+    GC,
+    SI,
+}
+
+fn get_future_multiplier(future_traded: FutureTraded) -> f64 {
+    match future_traded {
+        FutureTraded::NQ => 5.00,   // $5 per tick (0.25 tick size)
+        FutureTraded::ES => 12.50,  // $12.50 per tick (0.25 tick size)  
+        FutureTraded::YM => 5.00,   // $5 per tick (1.00 tick size)
+        FutureTraded::CL => 10.00,  // $10 per tick (0.01 tick size)
+        FutureTraded::GC => 10.00,  // $10 per tick (0.10 tick size)
+        FutureTraded::SI => 25.00,  // $25 per tick (0.005 tick size)
+    }
+}
+
+fn get_future_from_symbol(symbol: &str) -> Option<FutureTraded> {
+    if symbol.starts_with("NQ") {
+        Some(FutureTraded::NQ)
+    } else if symbol.starts_with("ES") {
+        Some(FutureTraded::ES)
+    } else if symbol.starts_with("YM") {
+        Some(FutureTraded::YM)
+    } else if symbol.starts_with("CL") {
+        Some(FutureTraded::CL)
+    } else if symbol.starts_with("GC") {
+        Some(FutureTraded::GC)
+    } else if symbol.starts_with("SI") {
+        Some(FutureTraded::SI)
+    } else {
+        None
+    }
+}
+
 impl Position {
     fn calculate_pnl_with_costs(
         &self,
@@ -20,14 +59,21 @@ impl Position {
         costs: &TransactionCosts,
         avg_volume: f64,
         is_options: bool,
+        futures_multiplier: Option<f64>,
     ) -> f64 {
         match self {
             Position::Long { entry, size, .. } => {
                 let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
                 let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
                 
-                // Apply options multiplier only for options trading
-                let multiplier = if is_options { 100.0 } else { 1.0 };
+                // Apply appropriate multiplier based on instrument type
+                let multiplier = if is_options { 
+                    100.0 
+                } else if let Some(futures_mult) = futures_multiplier {
+                    futures_mult
+                } else { 
+                    1.0 
+                };
                 let gross_pnl = (exit_price - entry) * size * multiplier;
                 
                 // Validate costs are finite - this is crucial
@@ -42,7 +88,13 @@ impl Position {
                 let entry_cost = costs.calculate_entry_cost(*entry, *size, avg_volume);
                 let exit_cost = costs.calculate_exit_cost(exit_price, *size, avg_volume);
                 
-                let multiplier = if is_options { 100.0 } else { 1.0 };
+                let multiplier = if is_options { 
+                    100.0 
+                } else if let Some(futures_mult) = futures_multiplier {
+                    futures_mult
+                } else { 
+                    1.0 
+                };
                 let gross_pnl = (entry - exit_price) * size * multiplier;
                 
                 if !entry_cost.is_finite() || !exit_cost.is_finite() || !gross_pnl.is_finite() {
@@ -174,15 +226,19 @@ impl BacktestResult {
 
 // Helper function to calculate average volume from candles
 fn calculate_average_volume(candles: &[Candle]) -> f64 {
-    let total_volume: f64 = candles.iter()
-        .filter_map(|candle| candle.get("volume"))
-        .sum();
-    
     if candles.is_empty() {
-        1000000.0 // Default fallback volume
-    } else {
-        total_volume / candles.len() as f64
+        return 1_000_000.0; // Default fallback if no candles at all
     }
+
+    let total_volume: f64 = candles.iter()
+        .map(|candle| {
+            candle.get("volume")
+                .or_else(|| candle.get("size"))  // fallback to "size"
+                .unwrap_or(0.0)                  // default if neither
+        })
+        .sum();
+
+    total_volume / candles.len() as f64
 }
 
 // Helper function to check if a limit order should be filled based on current candle
@@ -200,6 +256,7 @@ fn should_fill_limit_order(order: &Order, candle: &Candle) -> bool {
 // Generic function that works with any schema
 pub fn run_backtest_with_schema(
     csv_path: &str,
+    symbol: &str,
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
     strategy: &mut dyn Strategy,
@@ -224,11 +281,12 @@ pub fn run_backtest_with_schema(
     let candles = handler.csv_to_candles(csv_path)?;
     
     // Run backtest with candles
-    run_backtest_with_candles(candles, strategy, transaction_costs, starting_equity, exposure)
+    run_backtest_with_candles(symbol, candles, strategy, transaction_costs, starting_equity, exposure)
 }
 
 // Core backtesting logic that works with candles
 pub fn run_backtest_with_candles(
+    symbol: &str,
     candles: Vec<Candle>,
     strategy: &mut dyn Strategy,
     transaction_costs: TransactionCosts,
@@ -240,6 +298,13 @@ pub fn run_backtest_with_candles(
         candle.get_string("instrument_class").is_some() && 
         candle.get("strike_price").is_some()
     );
+
+    let is_futures_trading = symbol.ends_with(".v.0") || symbol.ends_with(".c.0");
+    let futures_multiplier = if is_futures_trading {
+        get_future_from_symbol(symbol).map(|future| get_future_multiplier(future))
+    } else {
+        None
+    };
     let mut equity = starting_equity;
     let mut position = Position::Neutral;
     let mut prev_candle: Option<Candle> = None;
@@ -415,10 +480,16 @@ pub fn run_backtest_with_candles(
                         //        contract_info, order.price, exit_price, entry);
                         
                         // Calculate PnL with transaction costs
-                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading);
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading, futures_multiplier);
                         
                         // Calculate gross PnL with appropriate multiplier
-                        let multiplier = if is_options_trading { 100.0 } else { 1.0 };
+                        let multiplier = if is_options_trading { 
+                            100.0 
+                        } else if let Some(futures_mult) = futures_multiplier {
+                            futures_mult
+                        } else { 
+                            1.0 
+                        };
                         let gross_pnl = (exit_price - entry) * size * multiplier;
                         let transaction_cost = gross_pnl - pnl;
 
@@ -481,10 +552,16 @@ pub fn run_backtest_with_candles(
                         //        contract_info, order.price, exit_price, entry);
                         
                         // Calculate PnL with transaction costs
-                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading);
+                        let pnl = position.calculate_pnl_with_costs(exit_price, &transaction_costs, avg_volume, is_options_trading, futures_multiplier);
                         
                         // Calculate gross PnL with appropriate multiplier
-                        let multiplier = if is_options_trading { 100.0 } else { 1.0 };
+                        let multiplier = if is_options_trading { 
+                            100.0 
+                        } else if let Some(futures_mult) = futures_multiplier {
+                            futures_mult
+                        } else { 
+                            1.0 
+                        };
                         let gross_pnl = (entry - exit_price) * size * multiplier;
                         let transaction_cost = gross_pnl - pnl;
 
@@ -552,6 +629,7 @@ pub fn run_backtest_with_candles(
 // Benchmark calculation that works with any schema
 pub fn calculate_benchmark_with_schema(
     csv_path: &str,
+    symbol: &str,
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
     starting_equity: f64,
@@ -568,6 +646,14 @@ pub fn calculate_benchmark_with_schema(
     if candles.is_empty() {
         return Err(anyhow::anyhow!("No candles found"));
     }
+
+    // Check if we're trading futures and get the multiplier
+    let is_futures_trading = symbol.ends_with(".v.0") || symbol.ends_with(".c.0");
+    let futures_multiplier = if is_futures_trading {
+        get_future_from_symbol(symbol).map(|future| get_future_multiplier(future))
+    } else {
+        None
+    };
 
     let first_candle = &candles[0];
     let last_candle = &candles[candles.len() - 1];
@@ -603,17 +689,24 @@ pub fn calculate_benchmark_with_schema(
     let size = capital / first_close;
     let entry_price = first_close;
 
+    // Apply appropriate multiplier for different instrument types
+    let multiplier = if let Some(futures_mult) = futures_multiplier {
+        futures_mult
+    } else {
+        1.0 // Default multiplier for stocks/other instruments
+    };
+
     // Calculate equity progression
     for candle in &candles[1..] {
         let close = candle.get(key)
             .ok_or_else(|| anyhow::anyhow!("Missing {} in candle", key))?;
 
-        equity = (close - entry_price) * size + starting_equity;
+        equity = (close - entry_price) * size * multiplier + starting_equity;
         equity_curve.push(equity);
     }
 
     let exit_price = last_close;
-    let pnl = (exit_price - entry_price) * size;
+    let pnl = (exit_price - entry_price) * size * multiplier;
     let pnl_pct = ((exit_price / entry_price) - 1.0) * 100.0;
 
     trades.push(Trade {
@@ -637,8 +730,9 @@ pub fn calculate_benchmark_with_schema(
     ))
 }
 
-pub fn run_backtest(
+pub fn run_individual_backtest(
     path: &str,
+    symbol: &str,
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
     strategy: &mut dyn Strategy,
@@ -646,15 +740,195 @@ pub fn run_backtest(
     exposure: f64,
     transactions_model: TransactionCosts,
 ) -> Result<BacktestResult> {
-    run_backtest_with_schema(path, schema, custom_schema, strategy, transactions_model, starting_equity, exposure)
+    run_backtest_with_schema(path, symbol, schema, custom_schema, strategy, transactions_model, starting_equity, exposure)
+}
+
+pub fn run_parallel_backtest<F>(
+    parameter_combinations: Vec<StrategyParams>,
+    path: &str,
+    symbol: &str,
+    schema: Schema,
+    custom_schema: Option<InkBackSchema>,
+    strategy_constructor: F,
+    starting_equity: f64,
+    exposure: f64,
+    transactions_model: TransactionCosts,
+) -> Option<Vec<(String, BacktestResult, Vec<f64>)>>
+where
+    F: Fn(&StrategyParams) -> anyhow::Result<Box<dyn Strategy>> + Sync + Send,
+{
+
+    println!("Testing {} parameter combinations...", parameter_combinations.len());
+
+    // Run backtests in parallel
+    let results: Vec<_> = parameter_combinations
+        .par_iter()
+        .enumerate()  // Add enumeration to track which strategy
+        .filter_map(|(index, params)| {
+            // Create a fresh strategy instance for each parameter set
+            let mut strategy = strategy_constructor(params).ok()?;
+
+            println!("Testing strategy {} with params: {:?}", index + 1, params);
+
+            let result = run_individual_backtest(
+                &path,
+                &symbol,
+                schema,
+                custom_schema.clone(),
+                strategy.as_mut(),
+                starting_equity,
+                exposure,
+                transactions_model.clone(),
+            ).ok()?;
+
+            // Validate equity curve has reasonable values
+            if result.equity_curve.iter().any(|&val| !val.is_finite()) {
+                println!("Warning: Strategy {} has non-finite equity values", index + 1);
+                return None;
+            }
+
+            // Create parameter label
+            let param_str = format!(
+                "Strategy_{}_Lookback({})_Momentum({:.1}%)_TP({:.0}%)_SL({:.0}%)_MinDays({:.0})",
+                index + 1,  // Add strategy index to make each unique
+                params.get("lookback_periods").unwrap_or(0.0) as usize,
+                params.get("momentum_threshold").unwrap_or(0.0),
+                params.get("profit_target").unwrap_or(0.0),
+                params.get("stop_loss").unwrap_or(0.0),
+                params.get("min_days_to_expiry").unwrap_or(0.0),
+            );
+
+            // Store equity curve with validation
+            let finite_curve: Vec<f64> = result.equity_curve.iter()
+                .map(|&val| if val.is_finite() { val } else { starting_equity })
+                .collect();
+            
+            Some((param_str, result, finite_curve))
+        })
+        .collect();
+
+    // Sort results by total return
+    let mut sorted_results = results;
+    sorted_results.sort_by(|a, b| b.1.total_return_pct.partial_cmp(&a.1.total_return_pct).unwrap_or(std::cmp::Ordering::Equal));
+
+    Some(sorted_results)
+}
+
+pub fn display_results(
+    sorted_results: Option<Vec<(String, BacktestResult, Vec<f64>)>>,
+    csv_path: &str,
+    symbol: &str,
+    schema: Schema,
+    custom_schema: Option<InkBackSchema>,
+    starting_equity: f64,
+    exposure: f64,
+) {
+
+    let mut equity_curves: Vec<(String, Vec<f64>)> = Vec::new();
+
+    // Run benchmark on underlying asset
+    let benchmark = calculate_benchmark(
+        &csv_path,
+        symbol, 
+        schema, 
+        custom_schema, 
+        starting_equity, 
+        exposure
+    ).unwrap();
+    
+    println!("Benchmark Return: {:.2}%, Max Drawdown: {:.2}%", 
+        benchmark.total_return_pct, benchmark.max_drawdown_pct);
+    
+    // Print results for all strategies
+    println!("\n=== ALL STRATEGY RESULTS ===");
+    println!("Benchmark: Return {:.2}%, Max DD: {:.2}%\n", 
+        benchmark.total_return_pct, benchmark.max_drawdown_pct);
+
+    if let Some(sorted_results) = sorted_results {
+        // Print results for all strategies
+        println!("\n=== ALL STRATEGY RESULTS ===");
+        println!("Benchmark: Return {:.2}%, Max DD: {:.2}%\n", 
+            benchmark.total_return_pct, benchmark.max_drawdown_pct);
+
+        for (i, (param_str, result, _)) in sorted_results.iter().enumerate() {
+            println!(
+                "{}. {}: Return: {:.2}%, Max DD: {:.2}%, Win Rate: {:.1}%, PF: {:.2}, Trades: {}, Fees: ${:.0}",
+                i + 1,
+                param_str,
+                if result.total_return_pct.is_finite() { result.total_return_pct } else { 0.0 },
+                if result.max_drawdown_pct.is_finite() { result.max_drawdown_pct } else { 0.0 },
+                if result.win_rate.is_finite() { result.win_rate } else { 0.0 },
+                if result.profit_factor.is_finite() { result.profit_factor } else { 0.0 },
+                result.total_trades,
+                if result.total_transaction_costs.is_finite() { result.total_transaction_costs } else { 0.0 }
+            );
+
+            // Store equity curve for plotting
+            equity_curves.push((param_str.clone(), sorted_results[i].2.clone()));
+        }
+
+        // Print summary statistics
+        if !sorted_results.is_empty() {
+            let profitable_strategies = sorted_results.iter()
+                .filter(|(_, result, _)| result.total_return_pct > 0.0)
+                .count();
+            
+            let avg_return: f64 = sorted_results.iter()
+                .map(|(_, result, _)| result.total_return_pct)
+                .sum::<f64>() / sorted_results.len() as f64;
+            
+            let best_return = sorted_results.first().map(|(_, result, _)| result.total_return_pct).unwrap_or(0.0);
+            let worst_return = sorted_results.last().map(|(_, result, _)| result.total_return_pct).unwrap_or(0.0);
+
+            println!("\n=== SUMMARY STATISTICS ===");
+            println!("Total strategies tested: {}", sorted_results.len());
+            println!("Profitable strategies: {} ({:.1}%)", 
+                profitable_strategies, 
+                (profitable_strategies as f64 / sorted_results.len() as f64) * 100.0);
+            println!("Average return: {:.2}%", avg_return);
+            println!("Best return: {:.2}%", best_return);
+            println!("Worst return: {:.2}%", worst_return);
+            println!("Benchmark return: {:.2}%", benchmark.total_return_pct);
+            
+            let outperforming = sorted_results.iter()
+                .filter(|(_, result, _)| result.total_return_pct > benchmark.total_return_pct)
+                .count();
+            println!("Strategies beating benchmark: {} ({:.1}%)", 
+                outperforming,
+                (outperforming as f64 / sorted_results.len() as f64) * 100.0);
+        }
+
+        // Plot equity curves
+        if !equity_curves.is_empty() {
+            println!("\nLaunching performance chart for all strategies...");
+            let finite_benchmark: Vec<f64> = benchmark.equity_curve.iter()
+                .map(|&val| if val.is_finite() { val } else { starting_equity })
+                .collect();
+            
+            // Limit the number of curves plotted to avoid clutter
+            let max_curves = 20;
+            let curves_to_plot = if equity_curves.len() > max_curves {
+                println!("Too many equity curves ({}), plotting only the top {} strategies.", 
+                    equity_curves.len(), max_curves);
+                equity_curves.into_iter().take(max_curves).collect()
+            } else {
+                equity_curves
+            };
+
+            plot_equity_curves(curves_to_plot, Some(finite_benchmark));
+        }
+    } else {
+        println!("Failed to run backtest - no results returned");
+    }
 }
 
 pub fn calculate_benchmark(
     path: &str,
+    symbol: &str,
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
     starting_equity: f64,
     exposure: f64,
 ) -> Result<BacktestResult> {
-    calculate_benchmark_with_schema(path, schema, custom_schema, starting_equity, exposure)
+    calculate_benchmark_with_schema(path, symbol, schema, custom_schema, starting_equity, exposure)
 }

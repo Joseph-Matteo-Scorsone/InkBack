@@ -1,5 +1,4 @@
 use std::{collections::VecDeque, usize};
-use rayon::prelude::*;
 use time::{macros::date, macros::time};
 use databento::{
     dbn::{Schema},
@@ -15,12 +14,12 @@ mod backtester;
 mod plot;
 pub mod slippage_models;
 
-use plot::plot_equity_curves;
 use strategy::Strategy;
 use utils::fetch::fetch_and_save_csv;
-use crate::{slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
+use crate::{backtester::{display_results, run_parallel_backtest}, slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
 
 // InkBack schemas
+#[derive(Clone)]
 pub enum InkBackSchema {
     FootPrint,
     CombinedOptionsUnderlying,
@@ -282,14 +281,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Fetch and save footprint data to CSV
     let schema = Schema::Trades;
-    let csv_path = fetch_and_save_csv(client, "GLBX.MDP3", "ES.v.0", None, schema, Some(InkBackSchema::FootPrint), start, end).await?;
-
-    // Run a benchmark buy-and-hold simulation
-    let benchmark = backtester::calculate_benchmark(&csv_path, schema, Some(InkBackSchema::FootPrint), starting_equity, exposure)?;
+    // Set the tick size for the future you are trading
+    let es_tick_size: f64 = 0.25;
+    let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
+    let symbol = "ES.v.0";
+    let csv_path = fetch_and_save_csv(client, "GLBX.MDP3", symbol, None, schema, Some(InkBackSchema::FootPrint), start, end).await?;
     
-    // Store equity curves for plotting
-    let mut equity_curves: Vec<(String, Vec<f64>)> = Vec::new();
-
     // Footprint strategy parameter ranges
     let imbalance_thresholds = vec![0.2, 0.3]; // imbalance percent
     let volume_thresholds = vec![200, 500]; // Minimum volume
@@ -317,60 +314,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Set the tick size for the future you are trading
-    let es_tick_size: f64 = 0.25;
-    let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
+    let sorted_results = run_parallel_backtest(
+        parameter_combinations,
+        &csv_path,
+        &symbol,
+        schema,
+        Some(InkBackSchema::FootPrint),
+        |params| Ok(Box::new(FootprintVolumeImbalance::new(params)?)),
+        starting_equity,
+        exposure,
+        transaction_costs.clone(),
+    );
 
-    // Run each strategy in parallel and collect backtest results
-    let results: Vec<_> = parameter_combinations
-        .par_iter()
-        .map(|params| {
-            let mut strategy = FootprintVolumeImbalance::new(params).expect("Invalid strategy parameters");
-
-            let result = backtester::run_backtest(
-                &csv_path,
-                schema,
-                Some(InkBackSchema::FootPrint),
-                &mut strategy,
-                starting_equity,
-                exposure,
-                transaction_costs.clone(),
-            ).expect("Backtest failed");
-
-            // Format parameter combination as a label
-            let param_str = format!(
-                "Imbalance({:.1}) Vol({}) Lookback({}) TP({:.1}%) SL({:.1}%)",
-                params.get("imbalance_threshold").unwrap_or(0.0) * 100.0,
-                params.get("volume_threshold").unwrap_or(0.0) as u64,
-                params.get("lookback_periods").unwrap_or(0.0) as usize,
-                params.get("tp").unwrap_or(0.0) * 100.0,
-                params.get("sl").unwrap_or(0.0) * 100.0,
-            );
-
-            (param_str, result)
-        })
-        .collect();
-
-    // Print metrics and store curves for GUI plotting
-    for (param_str, result) in results {
-        println!(
-            "{}: final_equity: {:.2}, total_return: {:.2}%, max_drawdown: {:.2}%, win_rate: {:.2}%, profit_factor: {:.2}, total_fees: ${:.2}, trades: {}",
-            param_str,
-            result.ending_equity,
-            result.total_return_pct,
-            result.max_drawdown_pct,
-            result.win_rate,
-            result.profit_factor,
-            result.total_transaction_costs,
-            result.total_trades
-        );
-
-        equity_curves.push((param_str, result.equity_curve));
-    }
-
-    // Show performance plots for all strategies vs. benchmark
-    println!("Launching chart...");
-    plot_equity_curves(equity_curves, Some(benchmark.equity_curve));
+    display_results(sorted_results, &csv_path, &symbol, schema, Some(InkBackSchema::FootPrint), starting_equity, exposure);
 
     Ok(())
 }

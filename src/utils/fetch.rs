@@ -448,7 +448,7 @@ pub async fn fetch_and_save_csv(
         InkBackSchema::FootPrint => {
             
             // Define bar interval (1 minute = 60_000_000_000 nanoseconds)
-            let bar_interval_ns = 60_000_000_000u64; // 1 minute
+            let bar_interval_ns = 60_000_000_000u64;
             
             writer.write_record(&["ts_event", "open", "high", "low", "close", "volume", "footprint_data"])?;
             
