@@ -31,10 +31,10 @@ impl Application for EquityPlotter {
 
     fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
         let (curves_data, benchmark) = flags;
-        
+
         // Generate colors for each curve
         let colors = generate_colors(curves_data.len());
-        
+
         let equity_curves: Vec<EquityCurve> = curves_data
             .into_iter()
             .enumerate()
@@ -74,7 +74,7 @@ impl Application for EquityPlotter {
         Command::none()
     }
 
-    fn view(&self) -> Element<Self::Message> {
+    fn view(&self) -> Element<'_, Self::Message> {
         let chart = Canvas::new(ChartRenderer {
             equity_curves: &self.equity_curves,
             benchmark: self.benchmark.as_ref(),
@@ -100,7 +100,7 @@ impl Application for EquityPlotter {
 }
 
 impl EquityPlotter {
-    fn create_controls(&self) -> Element<Message> {
+    fn create_controls(&self) -> Element<'_, Message> {
         let mut controls = column![
             text("Strategy Controls").size(20),
             text("Toggle visibility:").size(16),
@@ -111,7 +111,7 @@ impl EquityPlotter {
         if self.benchmark.is_some() {
             controls = controls.push(
                 checkbox("Show Benchmark", self.show_benchmark)
-                    .on_toggle(|_| Message::ToggleBenchmark)
+                    .on_toggle(|_| Message::ToggleBenchmark),
             );
         }
 
@@ -119,8 +119,10 @@ impl EquityPlotter {
         for (i, curve) in self.equity_curves.iter().enumerate() {
             let checkbox_widget = checkbox(&curve.label, curve.visible)
                 .on_toggle(move |_| Message::ToggleCurve(i))
-                .style(iced::theme::Checkbox::Custom(Box::new(CurveCheckboxStyle(curve.color))));
-            
+                .style(iced::theme::Checkbox::Custom(Box::new(CurveCheckboxStyle(
+                    curve.color,
+                ))));
+
             controls = controls.push(checkbox_widget);
         }
 
@@ -156,13 +158,11 @@ impl iced::widget::checkbox::StyleSheet for CurveCheckboxStyle {
         let mut appearance = self.active(style, is_checked);
         // Add slight transparency for hover effect
         appearance.background = match appearance.background {
-            iced::Background::Color(color) => {
-                        iced::Background::Color(Color {
-                            a: color.a * 0.8,
-                            ..color
-                        })
-                    }
-        iced::Background::Gradient(_gradient) => todo!(),
+            iced::Background::Color(color) => iced::Background::Color(Color {
+                a: color.a * 0.8,
+                ..color
+            }),
+            iced::Background::Gradient(_gradient) => todo!(),
         };
         appearance
     }
@@ -186,7 +186,7 @@ impl<'a> canvas::Program<Message> for ChartRenderer<'a> {
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        
+
         // Chart margins
         let margin = 80.0;
         let chart_bounds = Rectangle {
@@ -248,9 +248,16 @@ impl<'a> ChartRenderer<'a> {
 
         // Check visible equity curves
         for curve in self.equity_curves.iter().filter(|c| c.visible) {
-            if let (Some(&curve_min), Some(&curve_max)) = 
-                (curve.equity_data.iter().min_by(|a, b| a.partial_cmp(b).unwrap()),
-                 curve.equity_data.iter().max_by(|a, b| a.partial_cmp(b).unwrap())) {
+            if let (Some(&curve_min), Some(&curve_max)) = (
+                curve
+                    .equity_data
+                    .iter()
+                    .min_by(|a, b| a.partial_cmp(b).unwrap()),
+                curve
+                    .equity_data
+                    .iter()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap()),
+            ) {
                 min_val = min_val.min(curve_min);
                 max_val = max_val.max(curve_max);
             }
@@ -259,9 +266,10 @@ impl<'a> ChartRenderer<'a> {
         // Check benchmark if shown
         if self.show_benchmark {
             if let Some(benchmark) = self.benchmark {
-                if let (Some(&bench_min), Some(&bench_max)) = 
-                    (benchmark.iter().min_by(|a, b| a.partial_cmp(b).unwrap()),
-                     benchmark.iter().max_by(|a, b| a.partial_cmp(b).unwrap())) {
+                if let (Some(&bench_min), Some(&bench_max)) = (
+                    benchmark.iter().min_by(|a, b| a.partial_cmp(b).unwrap()),
+                    benchmark.iter().max_by(|a, b| a.partial_cmp(b).unwrap()),
+                ) {
                     min_val = min_val.min(bench_min);
                     max_val = max_val.max(bench_max);
                 }
@@ -275,7 +283,7 @@ impl<'a> ChartRenderer<'a> {
 
     fn find_max_length(&self) -> usize {
         let mut max_len = 0;
-        
+
         for curve in self.equity_curves.iter().filter(|c| c.visible) {
             max_len = max_len.max(curve.equity_data.len());
         }
@@ -300,8 +308,10 @@ impl<'a> ChartRenderer<'a> {
         use iced::widget::canvas::{Path, Stroke, Text};
 
         // Draw axes
-        let stroke = Stroke::default().with_width(1.0).with_color(Color::from_rgb(0.3, 0.3, 0.3));
-        
+        let stroke = Stroke::default()
+            .with_width(1.0)
+            .with_color(Color::from_rgb(0.3, 0.3, 0.3));
+
         // Y-axis
         let y_axis = Path::line(
             Point::new(bounds.x, bounds.y),
@@ -317,20 +327,22 @@ impl<'a> ChartRenderer<'a> {
         frame.stroke(&x_axis, stroke);
 
         // Draw grid lines and labels
-        let grid_stroke = Stroke::default().with_width(0.5).with_color(Color::from_rgb(0.2, 0.2, 0.2));
-        
+        let grid_stroke = Stroke::default()
+            .with_width(0.5)
+            .with_color(Color::from_rgb(0.2, 0.2, 0.2));
+
         // Horizontal grid lines for equity values
         for i in 0..=5 {
             let y_ratio = i as f32 / 5.0;
             let y = bounds.y + bounds.height * (1.0 - y_ratio);
             let value = min_val + (max_val - min_val) * y_ratio as f64;
-            
+
             let grid_line = Path::line(
                 Point::new(bounds.x, y),
                 Point::new(bounds.x + bounds.width, y),
             );
             frame.stroke(&grid_line, grid_stroke.clone());
-            
+
             // Y-axis labels
             let label = Text {
                 content: format!("{:.0}", value),
@@ -349,13 +361,13 @@ impl<'a> ChartRenderer<'a> {
             let x_ratio = i as f32 / 5.0;
             let x = bounds.x + bounds.width * x_ratio;
             let time_point = (max_length as f32 * x_ratio) as usize;
-            
+
             let grid_line = Path::line(
                 Point::new(x, bounds.y),
                 Point::new(x, bounds.y + bounds.height),
             );
             frame.stroke(&grid_line, grid_stroke.clone());
-            
+
             // X-axis labels
             let label = Text {
                 content: format!("{}", time_point),
@@ -387,23 +399,42 @@ impl<'a> ChartRenderer<'a> {
             return;
         }
 
+        let max_render_points = 5000;
+        let step = (data.len() / max_render_points).max(1);
+
         let path_builder = Path::new(|builder| {
             let value_range = max_val - min_val;
-            
-            for (i, &value) in data.iter().enumerate() {
+
+            // Iterate with step_by to skip points
+            for (i, &value) in data.iter().enumerate().step_by(step) {
+                // Calculate x based on the *original* index 'i' to maintain correct timeline
                 let x = bounds.x + (i as f32 / (max_length - 1) as f32) * bounds.width;
+
                 let y_ratio = if value_range != 0.0 {
                     ((value - min_val) / value_range) as f32
                 } else {
                     0.5
                 };
                 let y = bounds.y + bounds.height * (1.0 - y_ratio);
-                
+
                 if i == 0 {
                     builder.move_to(Point::new(x, y));
                 } else {
                     builder.line_to(Point::new(x, y));
                 }
+            }
+
+            // Ensure the very last point is drawn if it wasn't covered by the step
+            if step > 1 && !data.is_empty() {
+                let last_val = data.last().unwrap();
+                let x = bounds.x + bounds.width; // Far right
+                let y_ratio = if value_range != 0.0 {
+                    ((last_val - min_val) / value_range) as f32
+                } else {
+                    0.5
+                };
+                let y = bounds.y + bounds.height * (1.0 - y_ratio);
+                builder.line_to(Point::new(x, y));
             }
         });
 
@@ -428,7 +459,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
     let m = v - c;
-    
+
     let (r, g, b) = if h < 60.0 {
         (c, x, 0.0)
     } else if h < 120.0 {
@@ -442,7 +473,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
     } else {
         (c, 0.0, x)
     };
-    
+
     Color::from_rgb(r + m, g + m, b + m)
 }
 
@@ -455,10 +486,7 @@ pub fn run_equity_plotter(
 }
 
 // Called from main
-pub fn plot_equity_curves(
-    equity_curves: Vec<(String, Vec<f64>)>,
-    benchmark: Option<Vec<f64>>,
-) {
+pub fn plot_equity_curves(equity_curves: Vec<(String, Vec<f64>)>, benchmark: Option<Vec<f64>>) {
     if let Err(e) = run_equity_plotter(equity_curves, benchmark) {
         eprintln!("Error running Iced application: {}", e);
     }

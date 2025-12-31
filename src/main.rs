@@ -1,20 +1,23 @@
+use anyhow::Result;
+use databento::dbn::{SType, Schema};
 use std::{collections::VecDeque, usize};
 use time::{macros::date, macros::time};
-use databento::{
-    dbn::{Schema},
-};
-use anyhow::Result;
 
-mod schema_handler;
-mod utils;
-mod strategy;
 mod backtester;
+mod event;
 mod plot;
 pub mod slippage_models;
+mod strategy;
+mod utils;
 
+use crate::{
+    backtester::{display_results, run_parallel_backtest},
+    event::MarketEvent,
+    slippage_models::TransactionCosts,
+    strategy::{Order, OrderType, StrategyParams},
+};
 use strategy::Strategy;
-use utils::fetch::fetch_and_save_csv;
-use crate::{backtester::{display_results, run_parallel_backtest}, slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
+use utils::fetch::fetch_and_save_data;
 
 // InkBack schemas
 #[derive(Clone)]
@@ -23,39 +26,30 @@ pub enum InkBackSchema {
     CombinedOptionsUnderlying,
 }
 
-/// Option Momentum Strategy
-pub struct OptionsMomentumStrategy {
+/// Moving Average Cross Strategy
+pub struct MovingAverageCrossStrategy {
     // Strategy parameters
-    pub lookback_periods: usize,     // Periods to calculate momentum
-    pub momentum_threshold: f64,     // % momentum required for signal
-    pub profit_target: f64,          // % profit target
-    pub stop_loss: f64,              // % stop loss
-    pub min_days_to_expiry: f64,     // Minimum days to expiration
-    
-    // State tracking
-    pub underlying_history: VecDeque<f64>,
-    pub volume_history: VecDeque<u64>,
-    pub position_state: PositionState,
-    
-    // Current contract tracking
-    pub current_contract: Option<ContractInfo>,
-}
+    pub short_ma_period: usize, // Short moving average period
+    pub long_ma_period: usize,  // Long moving average period
+    pub volume_threshold: f64,  // Minimum volume threshold for trades
+    pub profit_target: f64,     // % profit target
+    pub stop_loss: f64,         // % stop loss
 
-#[derive(Debug, Clone)]
-pub struct ContractInfo {
-    pub instrument_id: u32,
-    pub symbol: String,
-    pub strike_price: f64,
-    pub expiration: u64,
-    pub option_type: OptionType,
+    // Moving average tracking
+    pub short_ma_history: VecDeque<f64>,
+    pub long_ma_history: VecDeque<f64>,
+    pub volume_history: VecDeque<u64>,
+
+    // Current state
+    pub position_state: PositionState,
     pub entry_price: f64,
     pub entry_time: String,
-}
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OptionType {
-    Call,
-    Put,
+    // Moving averages
+    pub short_ma: f64,
+    pub long_ma: f64,
+    pub prev_short_ma: f64,
+    pub prev_long_ma: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,299 +59,258 @@ pub enum PositionState {
     Short,
 }
 
-impl OptionsMomentumStrategy {
+impl MovingAverageCrossStrategy {
     pub fn new(params: &StrategyParams) -> Result<Self> {
-        let lookback_periods = params
-            .get("lookback_periods")
-            .ok_or_else(|| anyhow::anyhow!("Missing lookback_periods parameter"))? as usize;
-        
-        let momentum_threshold = params
-            .get("momentum_threshold")
-            .ok_or_else(|| anyhow::anyhow!("Missing momentum_threshold parameter"))? / 100.0;
-        
-        let profit_target = params
-            .get("profit_target")
-            .ok_or_else(|| anyhow::anyhow!("Missing profit_target parameter"))? / 100.0;
-        
-        let stop_loss = params
-            .get("stop_loss")
-            .ok_or_else(|| anyhow::anyhow!("Missing stop_loss parameter"))? / 100.0;
-        
-        let min_days_to_expiry = params
-            .get("min_days_to_expiry")
-            .ok_or_else(|| anyhow::anyhow!("Missing min_days_to_expiry parameter"))?;
-        
+        let short_ma_period = params
+            .get("short_ma_period")
+            .ok_or_else(|| anyhow::anyhow!("Missing short_ma_period parameter"))?
+            as usize;
+
+        let long_ma_period = params
+            .get("long_ma_period")
+            .ok_or_else(|| anyhow::anyhow!("Missing long_ma_period parameter"))?
+            as usize;
+
+        if short_ma_period >= long_ma_period {
+            return Err(anyhow::anyhow!(
+                "Short MA period must be less than long MA period"
+            ));
+        }
+
+        let volume_threshold = params.get("volume_threshold").unwrap_or(0.0);
+        let profit_target = params.get("profit_target").unwrap_or(0.0) / 100.0;
+        let stop_loss = params.get("stop_loss").unwrap_or(0.0) / 100.0;
+
         Ok(Self {
-            lookback_periods,
-            momentum_threshold,
+            short_ma_period,
+            long_ma_period,
+            volume_threshold,
             profit_target,
             stop_loss,
-            min_days_to_expiry,
-            underlying_history: VecDeque::with_capacity(lookback_periods + 1),
-            volume_history: VecDeque::with_capacity(lookback_periods + 1),
+            short_ma_history: VecDeque::with_capacity(short_ma_period),
+            long_ma_history: VecDeque::with_capacity(long_ma_period),
+            volume_history: VecDeque::with_capacity(long_ma_period),
             position_state: PositionState::Flat,
-            current_contract: None,
+            entry_price: 0.0,
+            entry_time: String::new(),
+            short_ma: 0.0,
+            long_ma: 0.0,
+            prev_short_ma: 0.0,
+            prev_long_ma: 0.0,
         })
     }
 
-    // Add a reset method to ensure clean state
+    // Reset method to ensure clean state
     pub fn reset(&mut self) {
-        self.underlying_history.clear();
+        self.short_ma_history.clear();
+        self.long_ma_history.clear();
         self.volume_history.clear();
         self.position_state = PositionState::Flat;
-        self.current_contract = None;
+        self.entry_price = 0.0;
+        self.entry_time.clear();
+        self.short_ma = 0.0;
+        self.long_ma = 0.0;
+        self.prev_short_ma = 0.0;
+        self.prev_long_ma = 0.0;
     }
 
-    /// Calculate momentum as percentage price change over lookback period
-    fn get_momentum(&self) -> Option<f64> {
-        if self.underlying_history.len() < self.lookback_periods {
-            return None;
+    /// Calculate simple moving average from a VecDeque
+    fn calculate_sma(history: &VecDeque<f64>) -> f64 {
+        if history.is_empty() {
+            return 0.0;
         }
-        
-        let current_price = *self.underlying_history.back()?;
-        let past_price = *self.underlying_history.get(self.underlying_history.len() - self.lookback_periods)?;
-        Some((current_price - past_price) / past_price)
+        history.iter().sum::<f64>() / history.len() as f64
     }
 
-    /// Parse option information from candle data
-    fn parse_option_info(&self, candle: &Candle) -> Option<(OptionType, f64, u64, u32, String)> {
-        // Get option type from instrument_class
-        let instrument_class_str = candle.get_string("instrument_class")?;
-        let option_type = match instrument_class_str.chars().next()? {
-            'C' => OptionType::Call,
-            'P' => OptionType::Put,
-            _ => {
-                println!("Warning: Unknown instrument class: {}", instrument_class_str);
-                return None;
-            }
-        };
-        
-        // Get strike price - must be positive
-        let strike_price = candle.get("strike_price")?;
-        if strike_price <= 0.0 {
-            println!("Warning: Invalid strike price: {}", strike_price);
-            return None;
+    /// Update moving averages
+    fn update_moving_averages(&mut self, price: f64) {
+        // Store previous values
+        self.prev_short_ma = self.short_ma;
+        self.prev_long_ma = self.long_ma;
+
+        // Add new price to histories
+        self.short_ma_history.push_back(price);
+        self.long_ma_history.push_back(price);
+
+        // Maintain window sizes
+        if self.short_ma_history.len() > self.short_ma_period {
+            self.short_ma_history.pop_front();
+        }
+        if self.long_ma_history.len() > self.long_ma_period {
+            self.long_ma_history.pop_front();
         }
 
-        // Expiration - must be positive
-        let expiration_f64 = candle.get("expiration")?;
-        if expiration_f64 <= 0.0 || !expiration_f64.is_finite() {
-            println!("Warning: Invalid expiration: {}", expiration_f64);
-            return None;
+        // Calculate new moving averages
+        if self.short_ma_history.len() == self.short_ma_period {
+            self.short_ma = Self::calculate_sma(&self.short_ma_history);
         }
-        let expiration = expiration_f64 as u64;
-        
-        // Get instrument ID for contract tracking
-        let instrument_id_f64 = candle.get("instrument_id")?;
-        if instrument_id_f64 <= 0.0 || !instrument_id_f64.is_finite() {
-            println!("Warning: Invalid instrument ID: {}", instrument_id_f64);
-            return None;
+        if self.long_ma_history.len() == self.long_ma_period {
+            self.long_ma = Self::calculate_sma(&self.long_ma_history);
         }
-        let instrument_id = instrument_id_f64 as u32;
-        
-        // Get symbol for logging - use raw_symbol or symbol_def
-        let symbol = candle.get_string("raw_symbol")
-            .or_else(|| candle.get_string("symbol_def"))
-            .or_else(|| candle.get_string("symbol"))
-            .unwrap_or(&"UNKNOWN".to_string())
-            .clone();
-        
-        Some((option_type, strike_price, expiration, instrument_id, symbol))
     }
 
-    /// Check if this option contract meets our trading criteria
-    fn should_trade_option(&self, candle: &Candle, underlying_price: f64) -> Option<OrderType> {
-        let option_price = candle.get("price")?;
-        
-        // Filter out options with extremely small premiums (< $0.05)
-        if option_price < 0.05 {
+    /// Check for moving average crossover signals
+    fn check_crossover_signal(&self) -> Option<OrderType> {
+        // Need full history for both MAs and previous values
+        if self.short_ma_history.len() < self.short_ma_period
+            || self.long_ma_history.len() < self.long_ma_period
+            || self.prev_short_ma == 0.0
+            || self.prev_long_ma == 0.0
+        {
             return None;
         }
-        
-        let (option_type, strike_price, expiration, _instrument_id, _symbol) = self.parse_option_info(candle)?;
-        //println!("expiration: {}\n", expiration);
-        
-        // Check days to expiration (assuming expiration is in UNIX timestamp format)
-        let current_time_ns = candle.date.parse::<u64>().unwrap_or_else(|_| {
-            println!("Warning: Failed to parse candle date: {}", candle.date);
-            0
-        });
-        
-        // Validate that we have valid timestamps
-        if current_time_ns == 0 || expiration == 0 {
-            return None;
+
+        // Golden Cross: Short MA crosses above Long MA (bullish signal)
+        if self.prev_short_ma <= self.prev_long_ma && self.short_ma > self.long_ma {
+            return Some(OrderType::MarketBuy);
         }
-        
-        // Convert nanoseconds to seconds
-        let current_time = current_time_ns / 1_000_000_000;
-        let expiration_seconds = expiration / 1_000_000_000;
-        
-        // Validate that expiration is in the future
-        if expiration_seconds <= current_time {
-            return None;
+
+        // Death Cross: Short MA crosses below Long MA (bearish signal)
+        if self.prev_short_ma >= self.prev_long_ma && self.short_ma < self.long_ma {
+            return Some(OrderType::MarketSell);
         }
-        
-        let days_to_expiry = (expiration_seconds - current_time) / 86400; // Convert seconds to days
-        if days_to_expiry <= self.min_days_to_expiry as u64 {
-            return None;
+
+        None
+    }
+
+    /// Check volume conditions
+    fn check_volume_condition(&self, current_volume: u64) -> bool {
+        if self.volume_threshold <= 0.0 {
+            return true; // No volume filter
         }
-        
-        // Get momentum
-        let momentum = self.get_momentum()?;
-        
-        match option_type {
-            OptionType::Call => {
-                // Calculate moneyness for calls (underlying/strike)
-                let moneyness = underlying_price / strike_price;
-                
-                // Filter out options more than 20% out of the money for better liquidity
-                if moneyness < 0.8 {
-                    return None;
-                }
-                
-                // Trade calls on positive momentum if the option is reasonable moneyness
-                if momentum > self.momentum_threshold {
-                    // Focus on near-the-money options for better delta exposure
-                    if moneyness >= 0.90 && moneyness <= 1.10 { // 10% ITM to 10% OTM
-                        Some(OrderType::MarketBuy)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            },
-            OptionType::Put => {
-                // Calculate moneyness for puts (strike/underlying)
-                let moneyness = strike_price / underlying_price;
-                
-                // Filter out options more than 20% out of the money
-                if moneyness < 0.8 {
-                    return None;
-                }
-                
-                // Trade puts on negative momentum if the option is reasonable moneyness
-                if momentum < -self.momentum_threshold {
-                    // Focus on near-the-money options for better delta exposure
-                    if moneyness >= 0.90 && moneyness <= 1.10 { // 10% ITM to 10% OTM
-                        Some(OrderType::MarketBuy)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            },
+
+        if self.volume_history.len() < 20 {
+            return true; // Not enough history, allow trade
         }
+
+        // Calculate average volume over last 20 periods
+        let avg_volume = self.volume_history.iter().rev().take(20).sum::<u64>() as f64 / 20.0;
+
+        current_volume as f64 >= avg_volume * self.volume_threshold
     }
 
     /// Check if we should exit current position
-    fn should_exit_position(&self, current_price: f64, current_time_ns: u64) -> bool {
-        if let Some(ref contract) = self.current_contract {
-            let pnl_pct = (current_price - contract.entry_price) / contract.entry_price;
-            
-            // Exit on profit target or stop loss
-            if pnl_pct >= self.profit_target || pnl_pct <= -self.stop_loss {
-                return true;
-            }
-            
-            // Force exit if too close to expiration (3 days or less)
-            let current_time = current_time_ns / 1_000_000_000;
-            let expiration_seconds = contract.expiration / 1_000_000_000;
-            
-            if expiration_seconds > current_time {
-                let days_to_expiry = (expiration_seconds - current_time) / 86400;
-                if days_to_expiry <= self.min_days_to_expiry as u64 {
-                    println!("Force exit: {} days to expiry", days_to_expiry);
-                    return true;
-                }
-            }
-            
-            false
-        } else {
-            false
+    fn should_exit_position(&self, current_price: f64) -> bool {
+        if self.position_state == PositionState::Flat || self.entry_price == 0.0 {
+            return false;
         }
+
+        let pnl_pct = match self.position_state {
+            PositionState::Long => (current_price - self.entry_price) / self.entry_price,
+            PositionState::Short => (self.entry_price - current_price) / self.entry_price,
+            PositionState::Flat => return false,
+        };
+
+        // Exit on profit target or stop loss (if configured)
+        if self.profit_target > 0.0 && pnl_pct >= self.profit_target {
+            return true;
+        }
+        if self.stop_loss > 0.0 && pnl_pct <= -self.stop_loss {
+            return true;
+        }
+
+        false
+    }
+
+    /// Get the trading price (handles bid/ask or uses close price)
+    fn get_trading_price(&self, event: &MarketEvent) -> f64 {
+        event.price()
     }
 }
 
-impl Strategy for OptionsMomentumStrategy {
-    fn on_candle(&mut self, candle: &Candle, _prev: Option<&Candle>) -> Option<Order> {
-        // Get underlying price and option price
-        let underlying_bid = candle.get("underlying_bid")?;
-        let underlying_ask = candle.get("underlying_ask")?;
-        let underlying_price = (underlying_bid + underlying_ask) / 2.0;
+impl Strategy for MovingAverageCrossStrategy {
+    fn on_event(&mut self, event: &MarketEvent, _prev: Option<&MarketEvent>) -> Option<Order> {
+        let current_price = self.get_trading_price(event);
 
-        let option_price = candle.get("price")?;
-        let size = candle.get("size")? as u64;
-        
-        // Update price and volume history
-        self.underlying_history.push_back(underlying_price);
-        self.volume_history.push_back(size);
-        
-        if self.underlying_history.len() > self.lookback_periods + 1 {
-            self.underlying_history.pop_front();
-        }
-        if self.volume_history.len() > self.lookback_periods + 1 {
-            self.volume_history.pop_front();
-        }
-
-        // If we're in a position, check for exit conditions first
-        if self.position_state != PositionState::Flat {
-            if let Some(ref current_contract) = self.current_contract {
-                // Only exit if this candle is for the same contract we're holding
-                if let Some((_, _, _, instrument_id, _)) = self.parse_option_info(candle) {
-                    if instrument_id == current_contract.instrument_id {
-                        let current_time_ns = candle.date.parse::<u64>().unwrap_or(0);
-                        if self.should_exit_position(option_price, current_time_ns) {
-                            // Reset position state
-                            self.position_state = PositionState::Flat;
-                            self.current_contract = None;
-                            
-                            return Some(Order {
-                                order_type: OrderType::MarketSell,
-                                price: option_price,
-                            });
-                        }
-                    }
-                }
-            }
-            return None; // Stay in position if no exit signal
-        }
-
-        // Need enough history for momentum calculation
-        if self.underlying_history.len() <= self.lookback_periods {
+        // Skip invalid prices
+        if current_price <= 0.0 {
             return None;
         }
 
-        // Check for entry signal
-        if let Some(order_type) = self.should_trade_option(candle, underlying_price) {
-            if let Some((option_type, strike_price, expiration, instrument_id, symbol)) = self.parse_option_info(candle) {
-                
-                // Create new contract info
-                let contract_info = ContractInfo {
-                    instrument_id,
-                    symbol: symbol.clone(),
-                    strike_price,
-                    expiration,
-                    option_type,
-                    entry_price: option_price,
-                    entry_time: candle.date.clone(),
+        // Get volume (handle different possible field names)
+        let volume = event.volume() as u64;
+
+        // Update volume history
+        self.volume_history.push_back(volume);
+        if self.volume_history.len() > 100 {
+            // Keep last 100 periods
+            self.volume_history.pop_front();
+        }
+
+        // Update moving averages
+        self.update_moving_averages(current_price);
+
+        // If we're in a position, check for exit conditions first
+        if self.position_state != PositionState::Flat {
+            if self.should_exit_position(current_price) {
+                let exit_order = match self.position_state {
+                    PositionState::Long => OrderType::MarketSell,
+                    PositionState::Short => OrderType::MarketBuy,
+                    PositionState::Flat => return None,
                 };
-                
-                // Update position state
-                self.position_state = match order_type {
-                    OrderType::MarketBuy => PositionState::Long,
-                    OrderType::MarketSell => PositionState::Short,
-                    OrderType::LimitBuy => todo!(),
-                    OrderType::LimitSell => todo!(),
-                };
-                self.current_contract = Some(contract_info);
-                
+
+                // Reset position state
+                self.position_state = PositionState::Flat;
+                self.entry_price = 0.0;
+                self.entry_time.clear();
+
                 return Some(Order {
-                    order_type,
-                    price: option_price,
+                    order_type: exit_order,
+                    price: current_price,
                 });
             }
+
+            // Check for opposite crossover signal to close position
+            if let Some(signal) = self.check_crossover_signal() {
+                let should_close = match (self.position_state, signal) {
+                    (PositionState::Long, OrderType::MarketSell) => true,
+                    (PositionState::Short, OrderType::MarketBuy) => true,
+                    _ => false,
+                };
+
+                if should_close {
+                    let exit_order = match self.position_state {
+                        PositionState::Long => OrderType::MarketSell,
+                        PositionState::Short => OrderType::MarketBuy,
+                        PositionState::Flat => return None,
+                    };
+
+                    // Reset position state
+                    self.position_state = PositionState::Flat;
+                    self.entry_price = 0.0;
+                    self.entry_time.clear();
+
+                    return Some(Order {
+                        order_type: exit_order,
+                        price: current_price,
+                    });
+                }
+            }
+
+            return None; // Stay in position if no exit signal
+        }
+
+        // Check for entry signal
+        if let Some(signal) = self.check_crossover_signal() {
+            // Check volume condition
+            if !self.check_volume_condition(volume) {
+                return None;
+            }
+
+            // Update position state
+            self.position_state = match signal {
+                OrderType::MarketBuy => PositionState::Long,
+                OrderType::MarketSell => PositionState::Short,
+                OrderType::LimitBuy => todo!(),
+                OrderType::LimitSell => todo!(),
+            };
+            self.entry_price = current_price;
+            self.entry_time = event.date_string();
+
+            return Some(Order {
+                order_type: signal,
+                price: current_price,
+            });
         }
 
         None
@@ -370,54 +323,54 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // Define historical data range
-    let start = date!(2025 - 06 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2025 - 06 - 30).with_time(time!(00:00)).assume_utc();
+    let start = date!(2025 - 01 - 01).with_time(time!(00:00)).assume_utc();
+    let end = date!(2025 - 12 - 01).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
-    let exposure = 0.10; // % of the account to put on each trade.
+    let exposure = 0.50; // % of capital allocated to each trade
 
-    // Create a client for historical market data
-    let client = databento::HistoricalClient::builder().key_from_env()?.build()?;
+    // Fetch and save footprint data to CSV
+    let schema = Schema::Ohlcv1H;
+    // Set the tick size for the future you are trading
+    let es_tick_size: f64 = 0.25;
+    let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
+    let symbol = "NQ.v.0";
+    let symbol_manager = fetch_and_save_data(
+        "GLBX.MDP3",
+        SType::Continuous,
+        symbol,
+        None,
+        schema,
+        None,
+        start,
+        end,
+    )
+    .await?;
 
-    // Fetch combined options and underlying data
-    println!("Fetching crude oil options and underlying data...");
-    let schema = Schema::Trades;
-    let symbol = "CL.c.0";
-    let csv_path = fetch_and_save_csv(
-        client, 
-        "GLBX.MDP3",        // Crude oil futures dataset
-        symbol,             // Crude oil continuous contract
-        Some("LO.OPT"),     // Light crude oil options
-        schema, 
-        Some(InkBackSchema::CombinedOptionsUnderlying), 
-        start, 
-        end
-    ).await?;
-
-    // Set transaction costs for options trading
-    let transaction_costs = TransactionCosts::options_trading();
-
-    // Define parameter ranges for the momentum strategy
-    let lookback_periods = vec![3, 5];                // Momentum calculation periods
-    let momentum_thresholds = vec![0.4];              // % momentum threshold
-    let profit_targets = vec![0.20, 0.40];            // % profit targets
-    let stop_losses = vec![0.20, 30.0];               // % stop losses
-    let min_days_to_expiry = vec![2.0];               // Minimum days to expiration
+    // Define parameter ranges for the moving average strategy
+    let short_ma_periods = vec![10, 20]; // Short MA periods
+    let long_ma_periods = vec![20, 50]; // Long MA periods
+    let volume_thresholds = vec![0.0, 1.2]; // Volume multipliers (0 = no filter)
+    let profit_targets = vec![5.0, 10.0]; // % profit targets
+    let stop_losses = vec![3.0, 5.0]; // % stop losses
 
     // Generate all parameter combinations
     let mut parameter_combinations = Vec::new();
-    for lookback in &lookback_periods {
-        for threshold in &momentum_thresholds {
-            for profit in &profit_targets {
-                for stop in &stop_losses {
-                    for min_days in &min_days_to_expiry {
-                        let mut params = StrategyParams::new();
-                        params.insert("lookback_periods", *lookback as f64);
-                        params.insert("momentum_threshold", *threshold);
-                        params.insert("profit_target", *profit);
-                        params.insert("stop_loss", *stop);
-                        params.insert("min_days_to_expiry", *min_days);
-                        parameter_combinations.push(params);
+    for short_ma in &short_ma_periods {
+        for long_ma in &long_ma_periods {
+            if short_ma < long_ma {
+                // Ensure short MA is less than long MA
+                for volume_thresh in &volume_thresholds {
+                    for profit_target in &profit_targets {
+                        for stop_loss in &stop_losses {
+                            let mut params = StrategyParams::new();
+                            params.insert("short_ma_period", *short_ma as f64);
+                            params.insert("long_ma_period", *long_ma as f64);
+                            params.insert("volume_threshold", *volume_thresh);
+                            params.insert("profit_target", *profit_target);
+                            params.insert("stop_loss", *stop_loss);
+                            parameter_combinations.push(params);
+                        }
                     }
                 }
             }
@@ -426,17 +379,26 @@ async fn main() -> anyhow::Result<()> {
 
     let sorted_results = run_parallel_backtest(
         parameter_combinations,
-        &csv_path,
+        symbol_manager.clone(),
         &symbol,
         schema,
-        Some(InkBackSchema::CombinedOptionsUnderlying),
-        |params| Ok(Box::new(OptionsMomentumStrategy::new(params)?)),
+        Some(InkBackSchema::FootPrint),
+        |params| Ok(Box::new(MovingAverageCrossStrategy::new(params)?)),
         starting_equity,
         exposure,
         transaction_costs.clone(),
     );
 
-    display_results(sorted_results, &csv_path, &symbol, schema, Some(InkBackSchema::CombinedOptionsUnderlying), starting_equity, exposure);
+    display_results(
+        sorted_results,
+        &symbol_manager.data_path,
+        &symbol,
+        schema,
+        Some(InkBackSchema::FootPrint),
+        starting_equity,
+        exposure,
+    )
+    .await;
 
     Ok(())
 }

@@ -1,20 +1,23 @@
+use anyhow::Result;
+use databento::dbn::{SType, Schema};
 use std::{collections::VecDeque, usize};
 use time::{macros::date, macros::time};
-use databento::{
-    dbn::{Schema},
-};
-use anyhow::Result;
 
-mod schema_handler;
-mod utils;
-mod strategy;
 mod backtester;
+mod event;
 mod plot;
 pub mod slippage_models;
+mod strategy;
+mod utils;
 
+use crate::{
+    backtester::{display_results, run_parallel_backtest},
+    event::MarketEvent,
+    slippage_models::TransactionCosts,
+    strategy::{Order, OrderType, StrategyParams},
+};
 use strategy::Strategy;
-use utils::fetch::fetch_and_save_csv;
-use crate::{backtester::{display_results, run_parallel_backtest}, slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
+use utils::fetch::fetch_and_save_data;
 
 // InkBack schemas
 #[derive(Clone)]
@@ -26,22 +29,22 @@ pub enum InkBackSchema {
 /// Moving Average Cross Strategy
 pub struct MovingAverageCrossStrategy {
     // Strategy parameters
-    pub short_ma_period: usize,      // Short moving average period
-    pub long_ma_period: usize,       // Long moving average period
-    pub volume_threshold: f64,       // Minimum volume threshold for trades
-    pub profit_target: f64,          // % profit target
-    pub stop_loss: f64,              // % stop loss
-    
+    pub short_ma_period: usize, // Short moving average period
+    pub long_ma_period: usize,  // Long moving average period
+    pub volume_threshold: f64,  // Minimum volume threshold for trades
+    pub profit_target: f64,     // % profit target
+    pub stop_loss: f64,         // % stop loss
+
     // Moving average tracking
     pub short_ma_history: VecDeque<f64>,
     pub long_ma_history: VecDeque<f64>,
     pub volume_history: VecDeque<u64>,
-    
+
     // Current state
     pub position_state: PositionState,
     pub entry_price: f64,
     pub entry_time: String,
-    
+
     // Moving averages
     pub short_ma: f64,
     pub long_ma: f64,
@@ -60,28 +63,24 @@ impl MovingAverageCrossStrategy {
     pub fn new(params: &StrategyParams) -> Result<Self> {
         let short_ma_period = params
             .get("short_ma_period")
-            .ok_or_else(|| anyhow::anyhow!("Missing short_ma_period parameter"))? as usize;
-        
+            .ok_or_else(|| anyhow::anyhow!("Missing short_ma_period parameter"))?
+            as usize;
+
         let long_ma_period = params
             .get("long_ma_period")
-            .ok_or_else(|| anyhow::anyhow!("Missing long_ma_period parameter"))? as usize;
-        
+            .ok_or_else(|| anyhow::anyhow!("Missing long_ma_period parameter"))?
+            as usize;
+
         if short_ma_period >= long_ma_period {
-            return Err(anyhow::anyhow!("Short MA period must be less than long MA period"));
+            return Err(anyhow::anyhow!(
+                "Short MA period must be less than long MA period"
+            ));
         }
-        
-        let volume_threshold = params
-            .get("volume_threshold")
-            .unwrap_or(0.0);
-        
-        let profit_target = params
-            .get("profit_target")
-            .unwrap_or(0.0) / 100.0;
-        
-        let stop_loss = params
-            .get("stop_loss")
-            .unwrap_or(0.0) / 100.0;
-        
+
+        let volume_threshold = params.get("volume_threshold").unwrap_or(0.0);
+        let profit_target = params.get("profit_target").unwrap_or(0.0) / 100.0;
+        let stop_loss = params.get("stop_loss").unwrap_or(0.0) / 100.0;
+
         Ok(Self {
             short_ma_period,
             long_ma_period,
@@ -128,11 +127,11 @@ impl MovingAverageCrossStrategy {
         // Store previous values
         self.prev_short_ma = self.short_ma;
         self.prev_long_ma = self.long_ma;
-        
+
         // Add new price to histories
         self.short_ma_history.push_back(price);
         self.long_ma_history.push_back(price);
-        
+
         // Maintain window sizes
         if self.short_ma_history.len() > self.short_ma_period {
             self.short_ma_history.pop_front();
@@ -140,7 +139,7 @@ impl MovingAverageCrossStrategy {
         if self.long_ma_history.len() > self.long_ma_period {
             self.long_ma_history.pop_front();
         }
-        
+
         // Calculate new moving averages
         if self.short_ma_history.len() == self.short_ma_period {
             self.short_ma = Self::calculate_sma(&self.short_ma_history);
@@ -153,9 +152,11 @@ impl MovingAverageCrossStrategy {
     /// Check for moving average crossover signals
     fn check_crossover_signal(&self) -> Option<OrderType> {
         // Need full history for both MAs and previous values
-        if self.short_ma_history.len() < self.short_ma_period ||
-           self.long_ma_history.len() < self.long_ma_period ||
-           self.prev_short_ma == 0.0 || self.prev_long_ma == 0.0 {
+        if self.short_ma_history.len() < self.short_ma_period
+            || self.long_ma_history.len() < self.long_ma_period
+            || self.prev_short_ma == 0.0
+            || self.prev_long_ma == 0.0
+        {
             return None;
         }
 
@@ -163,12 +164,12 @@ impl MovingAverageCrossStrategy {
         if self.prev_short_ma <= self.prev_long_ma && self.short_ma > self.long_ma {
             return Some(OrderType::MarketBuy);
         }
-        
+
         // Death Cross: Short MA crosses below Long MA (bearish signal)
         if self.prev_short_ma >= self.prev_long_ma && self.short_ma < self.long_ma {
             return Some(OrderType::MarketSell);
         }
-        
+
         None
     }
 
@@ -177,17 +178,14 @@ impl MovingAverageCrossStrategy {
         if self.volume_threshold <= 0.0 {
             return true; // No volume filter
         }
-        
+
         if self.volume_history.len() < 20 {
             return true; // Not enough history, allow trade
         }
-        
+
         // Calculate average volume over last 20 periods
-        let avg_volume = self.volume_history.iter()
-            .rev()
-            .take(20)
-            .sum::<u64>() as f64 / 20.0;
-        
+        let avg_volume = self.volume_history.iter().rev().take(20).sum::<u64>() as f64 / 20.0;
+
         current_volume as f64 >= avg_volume * self.volume_threshold
     }
 
@@ -215,38 +213,27 @@ impl MovingAverageCrossStrategy {
     }
 
     /// Get the trading price (handles bid/ask or uses close price)
-    fn get_trading_price(&self, candle: &Candle) -> f64 {
-        // Try to get bid/ask for more realistic pricing
-        if let (Some(bid), Some(ask)) = (candle.get("bid"), candle.get("ask")) {
-            if bid > 0.0 && ask > 0.0 && ask > bid {
-                return (bid + ask) / 2.0; // Use mid price
-            }
-        }
-        
-        // Fall back to close price
-        candle.get("close")
-            .or_else(|| candle.get("price"))
-            .unwrap_or(0.0)
+    fn get_trading_price(&self, event: &MarketEvent) -> f64 {
+        event.price()
     }
 }
 
 impl Strategy for MovingAverageCrossStrategy {
-    fn on_candle(&mut self, candle: &Candle, _prev: Option<&Candle>) -> Option<Order> {
-        let current_price = self.get_trading_price(candle);
-        
+    fn on_event(&mut self, event: &MarketEvent, _prev: Option<&MarketEvent>) -> Option<Order> {
+        let current_price = self.get_trading_price(event);
+
         // Skip invalid prices
         if current_price <= 0.0 {
             return None;
         }
 
         // Get volume (handle different possible field names)
-        let volume = candle.get("volume")
-            .or_else(|| candle.get("size"))
-            .unwrap_or(0.0) as u64;
+        let volume = event.volume() as u64;
 
         // Update volume history
         self.volume_history.push_back(volume);
-        if self.volume_history.len() > 100 { // Keep last 100 periods
+        if self.volume_history.len() > 100 {
+            // Keep last 100 periods
             self.volume_history.pop_front();
         }
 
@@ -261,18 +248,18 @@ impl Strategy for MovingAverageCrossStrategy {
                     PositionState::Short => OrderType::MarketBuy,
                     PositionState::Flat => return None,
                 };
-                
+
                 // Reset position state
                 self.position_state = PositionState::Flat;
                 self.entry_price = 0.0;
                 self.entry_time.clear();
-                
+
                 return Some(Order {
                     order_type: exit_order,
                     price: current_price,
                 });
             }
-            
+
             // Check for opposite crossover signal to close position
             if let Some(signal) = self.check_crossover_signal() {
                 let should_close = match (self.position_state, signal) {
@@ -280,26 +267,26 @@ impl Strategy for MovingAverageCrossStrategy {
                     (PositionState::Short, OrderType::MarketBuy) => true,
                     _ => false,
                 };
-                
+
                 if should_close {
                     let exit_order = match self.position_state {
                         PositionState::Long => OrderType::MarketSell,
                         PositionState::Short => OrderType::MarketBuy,
                         PositionState::Flat => return None,
                     };
-                    
+
                     // Reset position state
                     self.position_state = PositionState::Flat;
                     self.entry_price = 0.0;
                     self.entry_time.clear();
-                    
+
                     return Some(Order {
                         order_type: exit_order,
                         price: current_price,
                     });
                 }
             }
-            
+
             return None; // Stay in position if no exit signal
         }
 
@@ -309,7 +296,7 @@ impl Strategy for MovingAverageCrossStrategy {
             if !self.check_volume_condition(volume) {
                 return None;
             }
-            
+
             // Update position state
             self.position_state = match signal {
                 OrderType::MarketBuy => PositionState::Long,
@@ -318,8 +305,8 @@ impl Strategy for MovingAverageCrossStrategy {
                 OrderType::LimitSell => todo!(),
             };
             self.entry_price = current_price;
-            self.entry_time = candle.date.clone();
-            
+            self.entry_time = event.date_string();
+
             return Some(Order {
                 order_type: signal,
                 price: current_price,
@@ -336,45 +323,43 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // Define historical data range
-    let start = date!(2024 - 06 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2024 - 06 - 30).with_time(time!(00:00)).assume_utc();
+    let start = date!(2025 - 01 - 01).with_time(time!(00:00)).assume_utc();
+    let end = date!(2025 - 12 - 01).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
-    let exposure = 0.20; // Use 20% of account
+    let exposure = 0.50; // % of capital allocated to each trade
 
-    // Create a client for historical market data
-    let client = databento::HistoricalClient::builder().key_from_env()?.build()?;
-
-    // Fetch data
-    let schema = Schema::Ohlcv1H; // or Schema::Ohlcv1M for minute bars
+    // Fetch and save footprint data to CSV
+    let schema = Schema::Ohlcv1H;
+    // Set the tick size for the future you are trading
+    let es_tick_size: f64 = 0.25;
+    let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
     let symbol = "NQ.v.0";
-    let csv_path = fetch_and_save_csv(
-        client, 
-        "GLBX.MDP3",        // Futures dataset
-        symbol,           // NQ future
-        None,               // No options data needed
-        schema, 
-        None,               // No custom schema needed
-        start, 
-        end
-    ).await?;
-
-    // Set transaction costs for futures trading
-    let nq_tick_size = 0.25;
-    let transaction_costs = TransactionCosts::futures_trading(nq_tick_size);
+    let symbol_manager = fetch_and_save_data(
+        "GLBX.MDP3",
+        SType::Continuous,
+        symbol,
+        None,
+        schema,
+        None,
+        start,
+        end,
+    )
+    .await?;
 
     // Define parameter ranges for the moving average strategy
-    let short_ma_periods = vec![10, 20];       // Short MA periods
-    let long_ma_periods = vec![20, 50];        // Long MA periods
-    let volume_thresholds = vec![0.0, 1.2];    // Volume multipliers (0 = no filter)
-    let profit_targets = vec![5.0, 10.0];      // % profit targets 
-    let stop_losses = vec![3.0, 5.0];          // % stop losses
+    let short_ma_periods = vec![10, 20]; // Short MA periods
+    let long_ma_periods = vec![20, 50]; // Long MA periods
+    let volume_thresholds = vec![0.0, 1.2]; // Volume multipliers (0 = no filter)
+    let profit_targets = vec![5.0, 10.0]; // % profit targets
+    let stop_losses = vec![3.0, 5.0]; // % stop losses
 
     // Generate all parameter combinations
     let mut parameter_combinations = Vec::new();
     for short_ma in &short_ma_periods {
         for long_ma in &long_ma_periods {
-            if short_ma < long_ma { // Ensure short MA is less than long MA
+            if short_ma < long_ma {
+                // Ensure short MA is less than long MA
                 for volume_thresh in &volume_thresholds {
                     for profit_target in &profit_targets {
                         for stop_loss in &stop_losses {
@@ -394,17 +379,26 @@ async fn main() -> anyhow::Result<()> {
 
     let sorted_results = run_parallel_backtest(
         parameter_combinations,
-        &csv_path,
+        symbol_manager.clone(),
         &symbol,
         schema,
-        None,
+        Some(InkBackSchema::FootPrint),
         |params| Ok(Box::new(MovingAverageCrossStrategy::new(params)?)),
         starting_equity,
         exposure,
         transaction_costs.clone(),
     );
 
-    display_results(sorted_results, &csv_path, &symbol, schema, None, starting_equity, exposure);
+    display_results(
+        sorted_results,
+        &symbol_manager.data_path,
+        &symbol,
+        schema,
+        Some(InkBackSchema::FootPrint),
+        starting_equity,
+        exposure,
+    )
+    .await;
 
     Ok(())
 }

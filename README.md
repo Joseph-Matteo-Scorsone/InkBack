@@ -1,6 +1,6 @@
 # InkBack by Scorsone Enterprises
 
-A high-performance historical backtesting framework written in Rust, designed for quantitative trading strategy development and analysis. Built with DataBento for market data and Iced for visualization.
+A high performance historical backtesting framework written in Rust, designed for quantitative trading strategy development and analysis. Built with DataBento for market data and Iced for visualization.
 
 ## Features
 
@@ -10,7 +10,7 @@ A high-performance historical backtesting framework written in Rust, designed fo
 - **Real-time Visualization**: Interactive equity curve plotting with Iced GUI
 - **Order Flow Analysis**: Built-in footprint imbalance detection and volume analysis
 - **Realistic Trading**: Includes slippage models, transaction costs, and order pending logic
-- **Data Management**: Automatic DataBento data fetching and CSV caching
+- **Data Management**: Automatic DataBento data fetching and caching
 - **Risk Management**: Flexible position sizing and risk controls
 
 ## Architecture
@@ -20,7 +20,7 @@ InkBack follows a modular design:
 - **Strategy**: Define custom trading logic by implementing the `Strategy` trait
 - **Backtester**: Core engine that processes historical data and executes strategies
 - **Data Handler**: Manages DataBento integration and local data storage
-- **Visualization**: Real-time equity curve plotting and performance metrics
+- **Visualization**: Equity curve plotting and performance metrics
 
 ## Prerequisites
 
@@ -66,22 +66,23 @@ examples/equities/equities_example.rs
 ### Basic Strategy Implementation
 
 ```rust
-use crate::strategy::{Strategy, Candle, Order, OrderType};
+use crate::strategy::{Strategy, Order, OrderType};
+use crate::event::MarketEvent;
 
 pub struct MyStrategy {
     // Your strategy parameters and state
 }
 
 impl Strategy for MyStrategy {
-    fn on_candle(&mut self, candle: &Candle, prev: Option<&Candle>) -> Option<Order> {
+    fn on_event(&mut self, event: &MarketEvent, prev: Option<&MarketEvent>) -> Option<Order> {
         // Implement your trading logic here
         // Return Some(Order) to place an order, None to do nothing
         
-        let close_price = candle.get("close")?;
+        let close_price = event.price();
         
         // Example: Simple momentum strategy
-        if let Some(prev_candle) = prev {
-            let prev_close = prev_candle.get("close")?;
+        if let Some(prev_event) = prev {
+            let prev_close = prev_event.price();
             if close_price > prev_close * 1.01 {
                 return Some(Order {
                     order_type: OrderType::Buy,
@@ -97,17 +98,19 @@ impl Strategy for MyStrategy {
 
 ### Accessing Market Data
 
-The `Candle` struct provides access to all market data fields:
+The `MarketEvent` struct provides access to all market data fields:
 
 ```rust
 // Numeric fields (OHLCV, etc.)
-let close = candle.get("close")?;
-let volume = candle.get("volume")?;
-let high = candle.get("high")?;
+let close = event.price();
+let volume = event.volume();
+let high = event.high();
 
 // String fields (symbols, footprint data, etc.)
-let symbol = candle.get_string("symbol")?;
-let footprint = candle.get_string("footprint_data")?;
+let symbol = event.get_string("symbol")?;
+let footprint_data = event
+            .get_string("footprint_data")
+            .ok_or_else(|| anyhow::anyhow!("Missing footprint_data in event"))?;
 ```
 
 ## Data Sources
@@ -157,15 +160,15 @@ let results = param_ranges
 InkBack automatically calculates:
 
 - Total return and annualized return
-- Sharpe ratio and maximum drawdown
+- Maximum drawdown
 - Win rate and profit factor
 - Average trade duration
 - Risk-adjusted metrics
 
 ## Data Management
 
-- **Automatic Caching**: Downloaded data is saved locally as CSV
-- **Compression Handling**: Automatic decompression of DataBento's 9th exponent format
+- **Automatic Caching**: Downloaded data is saved locally
+- **Compression Handling**: ZSTD is fast, we use it
 - **Incremental Updates**: Only fetch new data when needed
 - **Multiple Timeframes**: Support for various data frequencies
 
@@ -180,7 +183,7 @@ The `examples/` directory contains complete implementations:
 
 ## Output
 
-![alt text](https://pbs.twimg.com/media/GwL7McvWgAAmqJa?format=png&name=large)
+![alt text](https://pbs.twimg.com/media/G9eWIS5XUAA3ruG?format=png&name=large)
 
 ## Contributing
 

@@ -1,22 +1,25 @@
-use std::{collections::VecDeque, usize};
-use time::{macros::date, macros::time};
-use databento::{
-    dbn::{Schema},
-};
+use anyhow::Result;
+use databento::dbn::{SType, Schema};
 use serde_json::Value;
 use std::collections::HashMap;
-use anyhow::Result;
+use std::{collections::VecDeque, usize};
+use time::{macros::date, macros::time};
 
-mod schema_handler;
-mod utils;
-mod strategy;
 mod backtester;
+mod event;
 mod plot;
 pub mod slippage_models;
+mod strategy;
+mod utils;
 
+use crate::{
+    backtester::{display_results, run_parallel_backtest},
+    event::MarketEvent,
+    slippage_models::TransactionCosts,
+    strategy::{Order, OrderType, StrategyParams},
+};
 use strategy::Strategy;
-use utils::fetch::fetch_and_save_csv;
-use crate::{backtester::{display_results, run_parallel_backtest}, slippage_models::TransactionCosts, strategy::{Candle, Order, OrderType, StrategyParams}};
+use utils::fetch::fetch_and_save_data;
 
 // InkBack schemas
 #[derive(Clone)]
@@ -32,8 +35,8 @@ pub struct FootprintVolumeImbalance {
     tp: f64,
     sl: f64,
     lookback_periods: usize,
-    
-    candle_history: VecDeque<Candle>,
+
+    event_history: VecDeque<MarketEvent>,
     last_signal: Option<OrderType>,
     current_position: Option<OrderType>,
     entry_price: Option<f64>,
@@ -44,13 +47,16 @@ impl FootprintVolumeImbalance {
     pub fn new(params: &StrategyParams) -> Result<Self, anyhow::Error> {
         let imbalance_threshold = params
             .get("imbalance_threshold")
-            .ok_or_else(|| anyhow::anyhow!("Missing imbalance_threshold parameter"))? as f64;
+            .ok_or_else(|| anyhow::anyhow!("Missing imbalance_threshold parameter"))?
+            as f64;
         let volume_threshold = params
             .get("volume_threshold")
-            .ok_or_else(|| anyhow::anyhow!("Missing volume_threshold parameter"))? as u64;
+            .ok_or_else(|| anyhow::anyhow!("Missing volume_threshold parameter"))?
+            as u64;
         let lookback_periods = params
             .get("lookback_periods")
-            .ok_or_else(|| anyhow::anyhow!("Missing lookback_periods parameter"))? as usize;
+            .ok_or_else(|| anyhow::anyhow!("Missing lookback_periods parameter"))?
+            as usize;
 
         let tp = params
             .get("tp")
@@ -65,7 +71,7 @@ impl FootprintVolumeImbalance {
             tp,
             sl,
             lookback_periods,
-            candle_history: VecDeque::with_capacity(lookback_periods),
+            event_history: VecDeque::with_capacity(lookback_periods),
             last_signal: None,
             current_position: None,
             entry_price: None,
@@ -73,7 +79,10 @@ impl FootprintVolumeImbalance {
     }
 
     /// Parse footprint data from JSON string
-    fn parse_footprint_data(&self, footprint_json: &str) -> Result<HashMap<String, (u64, u64)>, anyhow::Error> {
+    fn parse_footprint_data(
+        &self,
+        footprint_json: &str,
+    ) -> Result<HashMap<String, (u64, u64)>, anyhow::Error> {
         let parsed: Value = serde_json::from_str(footprint_json)?;
         let mut footprint_map = HashMap::new();
 
@@ -92,12 +101,13 @@ impl FootprintVolumeImbalance {
         Ok(footprint_map)
     }
 
-    /// Calculate volume imbalance for a candle
-    fn calculate_imbalance(&self, candle: &Candle) -> Result<f64, anyhow::Error> {
-        let footprint_data = candle.get_string("footprint_data")
-            .ok_or_else(|| anyhow::anyhow!("Missing footprint_data in candle"))?;
+    /// Calculate volume imbalance for a event
+    fn calculate_imbalance(&self, event: &MarketEvent) -> Result<f64, anyhow::Error> {
+        let footprint_data = event
+            .get_string("footprint_data")
+            .ok_or_else(|| anyhow::anyhow!("Missing footprint_data in event"))?;
 
-        let footprint_map = self.parse_footprint_data(footprint_data)?;
+        let footprint_map = self.parse_footprint_data(&footprint_data)?;
 
         let mut total_buy_volume = 0u64;
         let mut total_sell_volume = 0u64;
@@ -119,18 +129,17 @@ impl FootprintVolumeImbalance {
 
     /// Calculate volume-weighted average imbalance over lookback periods
     fn calculate_average_imbalance(&self) -> Result<f64, anyhow::Error> {
-        if self.candle_history.is_empty() {
+        if self.event_history.is_empty() {
             return Ok(0.0);
         }
 
         let mut weighted_imbalance = 0.0;
         let mut total_weight = 0.0;
 
-        for candle in &self.candle_history {
-            let volume = candle.get("volume")
-                .ok_or_else(|| anyhow::anyhow!("Missing volume in candle"))?;
-            let imbalance = self.calculate_imbalance(candle)?;
-            
+        for event in &self.event_history {
+            let volume = event.volume() as f64;
+            let imbalance = self.calculate_imbalance(event)?;
+
             weighted_imbalance += imbalance * volume;
             total_weight += volume;
         }
@@ -144,22 +153,20 @@ impl FootprintVolumeImbalance {
 }
 
 impl Strategy for FootprintVolumeImbalance {
-    fn on_candle(&mut self, candle: &Candle, _prev: Option<&Candle>) -> Option<Order> {
-        let close = candle.get("close")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'close' in candle")).expect("Candle Error");
+    fn on_event(&mut self, event: &MarketEvent, _prev: Option<&MarketEvent>) -> Option<Order> {
+        let close = event.price();
 
-        let volume = candle.get("volume")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'volume' in candle")).expect("Candle Error") as u64;
+        let volume = event.volume() as u64;
 
-        // Add candle to history
-        self.candle_history.push_back(candle.clone());
-        if self.candle_history.len() > self.lookback_periods {
-            self.candle_history.pop_front();
+        // Add event to history
+        self.event_history.push_back(event.clone());
+        if self.event_history.len() > self.lookback_periods {
+            self.event_history.pop_front();
         }
 
         // Need enough history to make decisions
-        if self.candle_history.len() < self.lookback_periods {
-        //    println!("Not enough history: {} < {}", self.candle_history.len(), self.lookback_periods);
+        if self.event_history.len() < self.lookback_periods {
+            //    println!("Not enough history: {} < {}", self.candle_history.len(), self.lookback_periods);
             return None;
         }
 
@@ -167,29 +174,29 @@ impl Strategy for FootprintVolumeImbalance {
         if let (Some(position), Some(entry)) = (self.current_position, self.entry_price) {
             match position {
                 OrderType::MarketBuy => {
-                                if close >= entry * (1.0 + self.tp) || close <= entry * (1.0 - self.sl) {
-                                    //println!("Exiting BUY position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
-                                    //        close, entry, entry * (1.0 + self.tp), entry * (1.0 - self.sl));
-                                    self.current_position = None;
-                                    self.entry_price = None;
-                                    return Some(Order {
-                                        order_type: OrderType::MarketSell,
-                                        price: close,
-                                    });
-                                }
-                            }
+                    if close >= entry * (1.0 + self.tp) || close <= entry * (1.0 - self.sl) {
+                        //println!("Exiting BUY position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}",
+                        //        close, entry, entry * (1.0 + self.tp), entry * (1.0 - self.sl));
+                        self.current_position = None;
+                        self.entry_price = None;
+                        return Some(Order {
+                            order_type: OrderType::MarketSell,
+                            price: close,
+                        });
+                    }
+                }
                 OrderType::MarketSell => {
-                                if close <= entry * (1.0 - self.tp) || close >= entry * (1.0 + self.sl) {
-                                    //println!("Exiting SELL position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}", 
-                                    //        close, entry, entry * (1.0 - self.tp), entry * (1.0 + self.sl));
-                                    self.current_position = None;
-                                    self.entry_price = None;
-                                    return Some(Order {
-                                        order_type: OrderType::MarketBuy,
-                                        price: close,
-                                    });
-                                }
-                            }
+                    if close <= entry * (1.0 - self.tp) || close >= entry * (1.0 + self.sl) {
+                        //println!("Exiting SELL position: close={:.2}, entry={:.2}, tp_level={:.2}, sl_level={:.2}",
+                        //        close, entry, entry * (1.0 - self.tp), entry * (1.0 + self.sl));
+                        self.current_position = None;
+                        self.entry_price = None;
+                        return Some(Order {
+                            order_type: OrderType::MarketBuy,
+                            price: close,
+                        });
+                    }
+                }
                 OrderType::LimitBuy => todo!(),
                 OrderType::LimitSell => todo!(),
             }
@@ -202,27 +209,27 @@ impl Strategy for FootprintVolumeImbalance {
         }
 
         // Calculate current imbalance
-        let current_imbalance = match self.calculate_imbalance(candle) {
+        let current_imbalance = match self.calculate_imbalance(event) {
             Ok(imbalance) => {
-            //    println!("Current imbalance: {:.4}", imbalance);
+                //    println!("Current imbalance: {:.4}", imbalance);
                 imbalance
-            },
+            }
             Err(e) => {
                 println!("Error calculating imbalance: {}", e);
                 return None;
-            },
+            }
         };
 
         // Calculate average imbalance over lookback period
         let avg_imbalance = match self.calculate_average_imbalance() {
             Ok(imbalance) => {
-            //    println!("Average imbalance: {:.4}", imbalance);
+                //    println!("Average imbalance: {:.4}", imbalance);
                 imbalance
-            },
+            }
             Err(e) => {
                 println!("Error calculating average imbalance: {}", e);
                 return None;
-            },
+            }
         };
 
         // Print footprint data for debugging
@@ -232,15 +239,15 @@ impl Strategy for FootprintVolumeImbalance {
 
         // Generate signals based on imbalance
         let new_signal = if current_imbalance > self.imbalance_threshold && avg_imbalance > 0.0 {
-            //println!("BUY signal: current_imbalance={:.4} > threshold={:.4} && avg_imbalance={:.4} > 0", 
+            //println!("BUY signal: current_imbalance={:.4} > threshold={:.4} && avg_imbalance={:.4} > 0",
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);
             Some(OrderType::MarketBuy)
         } else if current_imbalance < -self.imbalance_threshold && avg_imbalance < 0.0 {
-            //println!("SELL signal: current_imbalance={:.4} < -{:.4} && avg_imbalance={:.4} < 0", 
+            //println!("SELL signal: current_imbalance={:.4} < -{:.4} && avg_imbalance={:.4} < 0",
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);
             Some(OrderType::MarketSell)
         } else {
-            //println!("No signal: current_imbalance={:.4}, threshold={:.4}, avg_imbalance={:.4}", 
+            //println!("No signal: current_imbalance={:.4}, threshold={:.4}, avg_imbalance={:.4}",
             //        current_imbalance, self.imbalance_threshold, avg_imbalance);
             None
         };
@@ -271,22 +278,29 @@ async fn main() -> anyhow::Result<()> {
 
     // Define historical data range
     let start = date!(2025 - 01 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2025 - 06 - 01).with_time(time!(00:00)).assume_utc();
+    let end = date!(2025 - 12 - 01).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
     let exposure = 0.50; // % of capital allocated to each trade
-
-    // Create a client for historical market data
-    let client = databento::HistoricalClient::builder().key_from_env()?.build()?;
 
     // Fetch and save footprint data to CSV
     let schema = Schema::Trades;
     // Set the tick size for the future you are trading
     let es_tick_size: f64 = 0.25;
     let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
-    let symbol = "ES.v.0";
-    let csv_path = fetch_and_save_csv(client, "GLBX.MDP3", symbol, None, schema, Some(InkBackSchema::FootPrint), start, end).await?;
-    
+    let symbol = "NQ.v.0";
+    let symbol_manager = fetch_and_save_data(
+        "GLBX.MDP3",
+        SType::Continuous,
+        symbol,
+        None,
+        schema,
+        Some(InkBackSchema::FootPrint),
+        start,
+        end,
+    )
+    .await?;
+
     // Footprint strategy parameter ranges
     let imbalance_thresholds = vec![0.2, 0.3]; // imbalance percent
     let volume_thresholds = vec![200, 500]; // Minimum volume
@@ -316,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
 
     let sorted_results = run_parallel_backtest(
         parameter_combinations,
-        &csv_path,
+        symbol_manager.clone(),
         &symbol,
         schema,
         Some(InkBackSchema::FootPrint),
@@ -326,7 +340,16 @@ async fn main() -> anyhow::Result<()> {
         transaction_costs.clone(),
     );
 
-    display_results(sorted_results, &csv_path, &symbol, schema, Some(InkBackSchema::FootPrint), starting_equity, exposure);
+    display_results(
+        sorted_results,
+        &symbol_manager.data_path,
+        &symbol,
+        schema,
+        Some(InkBackSchema::FootPrint),
+        starting_equity,
+        exposure,
+    )
+    .await;
 
     Ok(())
 }
