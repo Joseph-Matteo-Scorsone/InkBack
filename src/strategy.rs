@@ -44,4 +44,14 @@ impl StrategyParams {
     pub fn get(&self, key: &str) -> Option<f64> {
         self.params.get(key).copied()
     }
+
+    pub fn to_string_representation(&self) -> String {
+        let mut parts: Vec<String> = self
+            .params
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect();
+        parts.sort();
+        parts.join(", ")
+    }
 }

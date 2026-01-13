@@ -503,7 +503,11 @@ where
                 return None;
             }
 
-            let param_str = format!("Strategy_{}", index + 1);
+            let param_str = format!(
+                "Strategy_{} [{}]",
+                index + 1,
+                params.to_string_representation()
+            );
             let finite_curve = result.equity_curve.clone();
             Some((param_str, result, finite_curve))
         })
