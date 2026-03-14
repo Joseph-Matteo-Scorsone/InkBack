@@ -326,8 +326,8 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // Define historical data range
-    let start = date!(2026 - 01 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2026 - 03 - 01).with_time(time!(00:00)).assume_utc();
+    let start = date!(2025 - 01 - 01).with_time(time!(00:00)).assume_utc();
+    let end = date!(2025 - 12 - 01).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
     let exposure = 0.50; // % of capital allocated to each trade
@@ -352,11 +352,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // Define parameter ranges for the moving average strategy
-    let short_ma_periods = vec![8, 13]; // Short MA periods
-    let long_ma_periods = vec![21, 30]; // Long MA periods
+    let short_ma_periods = vec![10, 20]; // Short MA periods
+    let long_ma_periods = vec![20, 50]; // Long MA periods
     let volume_thresholds = vec![0.0, 1.2]; // Volume multipliers (0 = no filter)
-    let profit_targets = vec![25.0, 50.0]; // % profit targets
-    let stop_losses = vec![20.0, 40.0]; // % stop losses
+    let profit_targets = vec![5.0, 10.0]; // % profit targets
+    let stop_losses = vec![3.0, 5.0]; // % stop losses
 
     // Generate all parameter combinations
     let mut parameter_combinations = Vec::new();
@@ -381,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Convert date range to nanosecond timestamps for walk forward windows
+    // Convert date range to nanosecond timestamps for walk-forward windows
     let start_ts = start.unix_timestamp_nanos() as u64;
     let end_ts = end.unix_timestamp_nanos() as u64;
 

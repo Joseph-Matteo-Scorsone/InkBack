@@ -117,6 +117,9 @@ pub struct BacktestResult {
     pub max_drawdown_pct: f64,
     pub win_rate: f64,
     pub profit_factor: f64,
+    pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,
+    pub calmar_ratio: f64,
     pub total_trades: usize,
     pub winning_trades: usize,
     pub losing_trades: usize,
@@ -130,7 +133,7 @@ pub struct BacktestResult {
 }
 
 impl BacktestResult {
-    fn calculate_metrics(
+    pub fn calculate_metrics(
         starting_equity: f64,
         ending_equity: f64,
         equity_curve: Vec<f64>,
@@ -205,6 +208,36 @@ impl BacktestResult {
 
         let total_transaction_costs: f64 = trades.iter().map(|t| t.transaction_costs).sum();
 
+        // Risk-adjusted metrics computed from per-trade returns
+        let (sharpe_ratio, sortino_ratio) = if total_trades >= 2 {
+            let returns: Vec<f64> = trades.iter().map(|t| t.pnl_pct / 100.0).collect();
+            let mean_r = returns.iter().sum::<f64>() / total_trades as f64;
+            let variance =
+                returns.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / total_trades as f64;
+            let std_r = variance.sqrt();
+            let sharpe = if std_r > 0.0 { mean_r / std_r } else { 0.0 };
+
+            // Semi-variance: only penalise negative returns
+            let downside_var =
+                returns.iter().map(|r| r.min(0.0).powi(2)).sum::<f64>() / total_trades as f64;
+            let downside_std = downside_var.sqrt();
+            let sortino = if downside_std > 0.0 {
+                mean_r / downside_std
+            } else {
+                0.0
+            };
+
+            (sharpe, sortino)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let calmar_ratio = if max_dd_pct > 0.0 {
+            total_return_pct / max_dd_pct
+        } else {
+            0.0
+        };
+
         Self {
             starting_equity,
             ending_equity,
@@ -214,6 +247,9 @@ impl BacktestResult {
             max_drawdown_pct: max_dd_pct,
             win_rate,
             profit_factor,
+            sharpe_ratio,
+            sortino_ratio,
+            calmar_ratio,
             total_trades,
             winning_trades,
             losing_trades,
@@ -238,6 +274,7 @@ pub async fn run_backtest(
     exposure: f64,
     schema: Schema,
     custom_schema: Option<InkBackSchema>,
+    time_range: Option<(u64, u64)>,
 ) -> Result<BacktestResult> {
     let is_options_trading = matches!(
         custom_schema,
@@ -272,6 +309,17 @@ pub async fn run_backtest(
     // ASYNC LOOP
     while let Some(event_res) = data_iter.next().await {
         let event = event_res?; // Handle Result
+
+        // Time filter
+        if let Some((start_ts, end_ts)) = time_range {
+            let ts = event.timestamp();
+            if ts < start_ts {
+                continue;
+            }
+            if ts >= end_ts {
+                break;
+            }
+        }
 
         // Update Avg Volume for slippage
         let vol = event.volume() as f64;
@@ -457,6 +505,67 @@ pub async fn run_backtest(
     ))
 }
 
+// Internal: runs parallel backtest with optional time range, returns params alongside results
+pub(crate) fn run_parallel_backtest_internal<F>(
+    parameter_combinations: &[StrategyParams],
+    backtest_manager: &BacktestManager,
+    symbol: &str,
+    schema: Schema,
+    custom_schema: Option<InkBackSchema>,
+    strategy_constructor: &F,
+    starting_equity: f64,
+    exposure: f64,
+    transactions_model: &TransactionCosts,
+    time_range: Option<(u64, u64)>,
+) -> Vec<(String, StrategyParams, BacktestResult, Vec<f64>)>
+where
+    F: Fn(&StrategyParams) -> anyhow::Result<Box<dyn Strategy>> + Sync + Send,
+{
+    let handle = tokio::runtime::Handle::current();
+
+    let mut results: Vec<_> = parameter_combinations
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, params)| {
+            let mut strategy = strategy_constructor(params).ok()?;
+
+            let result = handle
+                .block_on(run_backtest(
+                    symbol,
+                    backtest_manager.clone(),
+                    strategy.as_mut(),
+                    transactions_model.clone(),
+                    starting_equity,
+                    exposure,
+                    schema.clone(),
+                    custom_schema.clone(),
+                    time_range,
+                ))
+                .ok()?;
+
+            if result.equity_curve.iter().any(|&val| !val.is_finite()) {
+                return None;
+            }
+
+            let param_str = format!(
+                "Strategy_{} [{}]",
+                index + 1,
+                params.to_string_representation()
+            );
+            let finite_curve = result.equity_curve.clone();
+            Some((param_str, params.clone(), result, finite_curve))
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.2.sharpe_ratio
+            .partial_cmp(&a.2.sharpe_ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
+#[allow(dead_code)]
 pub fn run_parallel_backtest<F>(
     parameter_combinations: Vec<StrategyParams>,
     backtest_manager: BacktestManager,
@@ -476,52 +585,28 @@ where
         parameter_combinations.len()
     );
 
-    // Create a single runtime handle that all threads can use
-    let handle = tokio::runtime::Handle::current();
+    let results = run_parallel_backtest_internal(
+        &parameter_combinations,
+        &backtest_manager,
+        symbol,
+        schema,
+        custom_schema,
+        &strategy_constructor,
+        starting_equity,
+        exposure,
+        &transactions_model,
+        None,
+    );
 
-    let results: Vec<_> = parameter_combinations
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, params)| {
-            let mut strategy = strategy_constructor(params).ok()?;
-
-            // Use the existing runtime's handle
-            let result = handle
-                .block_on(run_backtest(
-                    symbol,
-                    backtest_manager.clone(),
-                    strategy.as_mut(),
-                    transactions_model.clone(),
-                    starting_equity,
-                    exposure,
-                    schema.clone(),
-                    custom_schema.clone(),
-                ))
-                .ok()?;
-
-            if result.equity_curve.iter().any(|&val| !val.is_finite()) {
-                return None;
-            }
-
-            let param_str = format!(
-                "Strategy_{} [{}]",
-                index + 1,
-                params.to_string_representation()
-            );
-            let finite_curve = result.equity_curve.clone();
-            Some((param_str, result, finite_curve))
-        })
-        .collect();
-
-    let mut sorted_results = results;
-    sorted_results.sort_by(|a, b| {
-        b.1.total_return_pct
-            .partial_cmp(&a.1.total_return_pct)
-            .unwrap()
-    });
-    Some(sorted_results)
+    Some(
+        results
+            .into_iter()
+            .map(|(label, _params, result, curve)| (label, result, curve))
+            .collect(),
+    )
 }
 
+#[allow(dead_code)]
 pub async fn calculate_benchmark(
     csv_path: &str,
     symbol: &str,
@@ -623,6 +708,7 @@ pub async fn calculate_benchmark(
     ))
 }
 
+#[allow(dead_code)]
 pub async fn display_results(
     sorted_results: Option<Vec<(String, BacktestResult, Vec<f64>)>>,
     csv_path: &str,
@@ -661,11 +747,14 @@ pub async fn display_results(
 
         for (i, (param_str, result, _)) in sorted_results.iter().enumerate() {
             println!(
-                "{}. {}: Return: {:.2}%, Max DD: {:.2}%, Win Rate: {:.1}%, PF: {:.2}, Trades: {}, Fees: ${:.0}",
+                "{}. {}: Ret: {:.2}%, DD: {:.2}%, Sharpe: {:.2}, Sortino: {:.2}, Calmar: {:.2}, WR: {:.1}%, PF: {:.2}, Trades: {}, Fees: ${:.0}",
                 i + 1,
                 param_str,
                 if result.total_return_pct.is_finite() { result.total_return_pct } else { 0.0 },
                 if result.max_drawdown_pct.is_finite() { result.max_drawdown_pct } else { 0.0 },
+                if result.sharpe_ratio.is_finite() { result.sharpe_ratio } else { 0.0 },
+                if result.sortino_ratio.is_finite() { result.sortino_ratio } else { 0.0 },
+                if result.calmar_ratio.is_finite() { result.calmar_ratio } else { 0.0 },
                 if result.win_rate.is_finite() { result.win_rate } else { 0.0 },
                 if result.profit_factor.is_finite() { result.profit_factor } else { 0.0 },
                 result.total_trades,
