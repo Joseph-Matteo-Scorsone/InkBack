@@ -73,12 +73,7 @@ impl eframe::App for EquityPlotter {
                                 .enumerate()
                                 .map(|(i, &v)| [i as f64, v])
                                 .collect();
-                            plot_ui.line(
-                                Line::new(points)
-                                    .name("Benchmark")
-                                    .color(Color32::WHITE)
-                                    .width(2.0),
-                            );
+                            plot_ui.line(Line::new(points).color(Color32::WHITE).width(2.0));
                         }
                     }
 
@@ -89,12 +84,7 @@ impl eframe::App for EquityPlotter {
                             .enumerate()
                             .map(|(i, &v)| [i as f64, v])
                             .collect();
-                        plot_ui.line(
-                            Line::new(points)
-                                .name(&curve.label)
-                                .color(curve.color)
-                                .width(1.5),
-                        );
+                        plot_ui.line(Line::new(points).color(curve.color).width(1.5));
                     }
                 });
         });
