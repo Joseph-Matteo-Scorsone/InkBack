@@ -12,7 +12,7 @@ use databento::{
     HistoricalClient,
 };
 use futures::stream::{self, Stream};
-use std::collections::{self, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use time::OffsetDateTime;
@@ -39,7 +39,7 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                             Err(e) => Some((Err(anyhow::anyhow!(e)), dec)),
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(stream) as MarketStream)
                 }
                 Schema::Mbo => {
                     let stream = stream::unfold(decoder, |mut dec| async move {
@@ -49,7 +49,7 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                             Err(e) => Some((Err(anyhow::anyhow!(e)), dec)),
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(stream) as MarketStream)
                 }
                 Schema::Mbp1 => {
                     let stream = stream::unfold(decoder, |mut dec| async move {
@@ -59,7 +59,7 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                             Err(e) => Some((Err(anyhow::anyhow!(e)), dec)),
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(stream) as MarketStream)
                 }
                 Schema::Definition => {
                     let stream = stream::unfold(decoder, |mut dec| async move {
@@ -69,7 +69,7 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                             Err(e) => Some((Err(anyhow::anyhow!(e)), dec)),
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(stream) as MarketStream)
                 }
                 Schema::Ohlcv1S | Schema::Ohlcv1M | Schema::Ohlcv1H | Schema::Ohlcv1D => {
                     let stream = stream::unfold(decoder, |mut dec| async move {
@@ -79,7 +79,7 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                             Err(e) => Some((Err(anyhow::anyhow!(e)), dec)),
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(stream) as MarketStream)
                 }
                 _ => Err(anyhow::anyhow!(
                     "Schema {:?} not yet supported in get_data_stream",
@@ -207,11 +207,12 @@ pub async fn get_data_stream(path_str: &str, schema: Schema) -> Result<MarketStr
                 }
             });
 
-            Ok(Box::pin(stream::iter(iter)))
+            Ok(Box::pin(stream::iter(iter)) as MarketStream)
         }
         _ => Err(anyhow::anyhow!("Unsupported file extension: {}", extension)),
     }
 }
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct BacktestManager {
@@ -237,6 +238,7 @@ pub async fn fetch_and_save_data(
     custom_schema: Option<InkBackSchema>,
     start: OffsetDateTime,
     end: OffsetDateTime,
+    bar_interval_ns: Option<u64>,
 ) -> Result<BacktestManager> {
     let req_schema = if let Some(ref cs) = custom_schema {
         match cs {
@@ -351,7 +353,6 @@ pub async fn fetch_and_save_data(
                 let file = std::fs::File::create(&csv_filename)?;
                 let mut writer = Writer::from_writer(file);
                 let mut decoder = AsyncDbnDecoder::from_zstd_file(&filename).await.ok();
-                let bar_interval_ns = 60_000_000_000u64;
 
                 writer.write_record(&[
                     "ts_event",
@@ -367,10 +368,11 @@ pub async fn fetch_and_save_data(
                 let mut current_bar_trades: Vec<TradeMsg> = Vec::new();
                 let scaling_factor = 1e-9;
 
+                let interval_ns = bar_interval_ns.unwrap_or(15_000_000_000u64);
                 if let Some(dec) = &mut decoder {
                     while let Ok(Some(msg)) = dec.decode_record::<TradeMsg>().await {
                         let trade_time = msg.ts_recv;
-                        let bar_start = (trade_time / bar_interval_ns) * bar_interval_ns;
+                        let bar_start = (trade_time / interval_ns) * interval_ns;
 
                         if let Some(prev_bar_start) = current_bar_start {
                             if bar_start != prev_bar_start {
@@ -486,6 +488,9 @@ pub async fn fetch_and_save_data(
 
                 if !Path::new(&opt_def_file).exists() {
                     println!("Downloading Option Definitions...");
+                    let opt_sym = option_symbol.ok_or_else(|| {
+                        anyhow::anyhow!("option_symbol is required for CombinedOptionsUnderlying")
+                    })?;
                     let mut client = HistoricalClient::builder().key_from_env()?.build()?;
                     client
                         .timeseries()
@@ -494,7 +499,7 @@ pub async fn fetch_and_save_data(
                                 .dataset(options_dataset)
                                 .stype_in(SType::Parent)
                                 .date_time_range((start, end))
-                                .symbols(option_symbol.unwrap())
+                                .symbols(opt_sym)
                                 .schema(Schema::Definition)
                                 .path(&opt_def_file)
                                 .build(),
@@ -502,95 +507,81 @@ pub async fn fetch_and_save_data(
                         .await?;
                 }
 
+                // Decode definitions once
                 println!("Building Definition Map...");
-                let mut def_map: HashMap<u32, OptionDef> = HashMap::new();
-                let mut def_decoder = AsyncDbnDecoder::from_zstd_file(&opt_def_file).await?;
+                let mut opt_ids: Vec<u32> = Vec::new();
+                {
+                    let mut def_decoder = AsyncDbnDecoder::from_zstd_file(&opt_def_file).await?;
+                    while let Ok(Some(rec)) = def_decoder.decode_record::<InstrumentDefMsg>().await
+                    {
+                        opt_ids.push(rec.hd.instrument_id);
+                    }
+                }
 
-                // We need to collect IDs to request trades
-                let mut opt_ids = Vec::new();
-
-                while let Ok(Some(rec)) = def_decoder.decode_record::<InstrumentDefMsg>().await {
-                    let inst_id = rec.hd.instrument_id;
-                    // Parse instrument_class for C/P
-                    let type_char = rec.instrument_class as u8 as char;
-                    let opt_type = if type_char == 'C' { "C" } else { "P" }.to_string();
-
-                    let raw_strike = rec.strike_price;
-                    let final_strike = if raw_strike == i64::MAX {
-                        0.0 // Treat UNDEF as 0.0
-                    } else {
-                        (raw_strike as f64) * 1e-9
-                    };
-
-                    // Extract symbol from raw_symbol array
-                    let sym_str = std::str::from_utf8(unsafe {
-                        std::slice::from_raw_parts(
-                            rec.raw_symbol.as_ptr() as *const u8,
-                            rec.raw_symbol.len(),
-                        )
-                    })
-                    .unwrap()
-                    .trim_matches(char::from(0))
-                    .to_string();
-
-                    def_map.insert(
-                        inst_id,
-                        OptionDef {
-                            symbol: sym_str,
-                            strike_price: final_strike,
-                            expiration: rec.expiration,
-                            option_type: opt_type,
-                        },
-                    );
-                    opt_ids.push(inst_id);
+                if opt_ids.is_empty() {
+                    return Err(anyhow::anyhow!("No relevant options found for {}", symbol));
                 }
 
                 // Check Options Data File
                 if !Path::new(&opt_trades_file).exists() {
-                    // Decode Definitions for the download request
-                    let mut opt_ids = collections::HashMap::new();
-                    let mut def_decoder = AsyncDbnDecoder::from_zstd_file(&opt_def_file).await.ok();
-                    if let Some(dec) = &mut def_decoder {
-                        while let Ok(Some(msg)) = dec.decode_record::<InstrumentDefMsg>().await {
-                            opt_ids.insert(msg.hd.instrument_id, msg.clone());
-                        }
-                    }
-                    if opt_ids.is_empty() {
-                        return Err(anyhow::anyhow!("No relevant options found for {}", symbol));
-                    }
-
                     let mut opt_client = HistoricalClient::builder()
                         .key_from_env()
                         .context("Missing DataBento Key")?
                         .build()?;
 
                     let batch_size = 2_000;
-                    let opt_req_ids: Vec<u32> = opt_ids.keys().cloned().collect();
-                    for chunk in opt_req_ids.chunks(batch_size) {
-                        let ids_vec: Vec<u32> = chunk.to_vec();
-                        opt_client
-                            .timeseries()
-                            .get_range_to_file(
-                                &GetRangeToFileParams::builder()
-                                    .dataset(options_dataset)
-                                    .stype_in(SType::InstrumentId)
-                                    .date_time_range((start, end))
-                                    .symbols(ids_vec)
-                                    .schema(Schema::Trades)
-                                    .path(&opt_trades_file)
-                                    .build(),
-                            )
-                            .await?;
+                    let mut batch_files: Vec<String> = Vec::new();
+
+                    for (i, chunk) in opt_ids.chunks(batch_size).enumerate() {
+                        let batch_path = format!("{}.batch{}", opt_trades_file, i);
+                        if !Path::new(&batch_path).exists() {
+                            opt_client
+                                .timeseries()
+                                .get_range_to_file(
+                                    &GetRangeToFileParams::builder()
+                                        .dataset(options_dataset)
+                                        .stype_in(SType::InstrumentId)
+                                        .date_time_range((start, end))
+                                        .symbols(chunk.to_vec())
+                                        .schema(Schema::Trades)
+                                        .path(&batch_path)
+                                        .build(),
+                                )
+                                .await?;
+                        }
+                        batch_files.push(batch_path);
                     }
-                    println!("Saved Data (Options + Underlying)");
+
+                    println!(
+                        "Saved Data ({} batch(es) of options trades)",
+                        batch_files.len()
+                    );
                 } else {
                     println!("Options Data found at: {}", opt_trades_file);
                 }
 
+                // Collect whichever batch files exist (or the single trades file)
+                let options_files: Vec<String> = if Path::new(&opt_trades_file).exists() {
+                    vec![opt_trades_file.clone()]
+                } else {
+                    let mut v: Vec<String> = Vec::new();
+                    let mut i = 0;
+                    loop {
+                        let p = format!("{}.batch{}", opt_trades_file, i);
+                        if Path::new(&p).exists() {
+                            v.push(p);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    v
+                };
+
                 println!("Merging Underlying and Options into CSV...");
                 merge_streams_to_csv(
                     &underlying_file,
-                    &opt_trades_file,
+                    &options_files,
                     &opt_def_file,
                     &final_merged_csv,
                 )
@@ -613,13 +604,12 @@ pub async fn fetch_and_save_data(
 
 async fn merge_streams_to_csv(
     underlying_path: &str,
-    options_path: &str,
+    options_paths: &[String],
     def_path: &str,
     output_path: &str,
 ) -> Result<()> {
     let mut writer = Writer::from_path(output_path)?;
 
-    // Write Header
     writer.write_record(&[
         "ts_event",
         "event_type",
@@ -636,12 +626,9 @@ async fn merge_streams_to_csv(
         "underlying_ask_sz",
     ])?;
 
-    // We read the entire definition file first so the map is fully populated
-    // before we process a single trade.
+    // Pre-load definitions so every trade lookup is instant
     println!("Pre-loading definitions from {}...", def_path);
     let mut def_map: HashMap<u32, OptionDef> = HashMap::new();
-
-    // Scope the decoder so it drops the file handle when done
     {
         let mut def_decoder = AsyncDbnDecoder::from_zstd_file(def_path)
             .await
@@ -674,123 +661,122 @@ async fn merge_streams_to_csv(
     }
     println!("Loaded {} definitions.", def_map.len());
 
-    let mut und_decoder = AsyncDbnDecoder::from_zstd_file(underlying_path).await.ok();
-    let mut opt_decoder = AsyncDbnDecoder::from_zstd_file(options_path).await.ok();
-
+    // Stream 0 = underlying, streams 1..=N = one per options batch file
+    // Each slot: Option<(timestamp, msg)>
+    #[derive(Clone)]
     enum StreamMsg {
         Underlying(Mbp1Msg),
         Option(TradeMsg),
     }
 
-    // streams[0] = Underlying, [1] = Options
-    let mut streams: [Option<(u64, StreamMsg)>; 2] = [None, None];
+    let mut und_decoder = AsyncDbnDecoder::from_zstd_file(underlying_path).await.ok();
+    let mut opt_decoders: Vec<_> = Vec::new();
+    for path in options_paths {
+        if let Ok(dec) = AsyncDbnDecoder::from_zstd_file(path).await {
+            opt_decoders.push(Some(dec));
+        }
+    }
 
+    // slots[0] = underlying, slots[1..] = one per opt decoder
+    let total = 1 + opt_decoders.len();
+    let mut slots: Vec<Option<(u64, StreamMsg)>> = vec![None; total];
+
+    // Prime the underlying slot
     if let Some(dec) = &mut und_decoder {
         if let Ok(Some(msg)) = dec.decode_record::<Mbp1Msg>().await {
-            streams[0] = Some((msg.hd.ts_event, StreamMsg::Underlying(msg.clone())));
+            slots[0] = Some((msg.hd.ts_event, StreamMsg::Underlying(msg.clone())));
         }
     }
-    if let Some(dec) = &mut opt_decoder {
-        if let Ok(Some(msg)) = dec.decode_record::<TradeMsg>().await {
-            streams[1] = Some((msg.hd.ts_event, StreamMsg::Option(msg.clone())));
-        }
-    }
-
-    // State needed for enrichment
-    let mut last_und_bid = 0.0;
-    let mut last_und_ask = 0.0;
-    let mut last_und_bid_sz = 0;
-    let mut last_und_ask_sz = 0;
-
-    println!("Starting Merge...");
-
-    // K-Way Merge Loop
-    loop {
-        let mut min_ts = u64::MAX;
-        let mut min_idx = None;
-
-        for (i, stream_opt) in streams.iter().enumerate() {
-            if let Some((ts, _)) = stream_opt {
-                if *ts < min_ts {
-                    min_ts = *ts;
-                    min_idx = Some(i);
-                }
+    // Prime each options slot
+    for (i, opt_dec) in opt_decoders.iter_mut().enumerate() {
+        if let Some(dec) = opt_dec {
+            if let Ok(Some(msg)) = dec.decode_record::<TradeMsg>().await {
+                slots[i + 1] = Some((msg.hd.ts_event, StreamMsg::Option(msg.clone())));
             }
         }
+    }
 
-        if let Some(idx) = min_idx {
-            if let Some((_, msg)) = streams[idx].take() {
-                match msg {
-                    StreamMsg::Underlying(u) => {
-                        let price = (u.price as f64) * 1e-9;
-                        if !u.levels.is_empty() {
-                            last_und_bid = (u.levels[0].bid_px as f64) * 1e-9;
-                            last_und_ask = (u.levels[0].ask_px as f64) * 1e-9;
-                            last_und_bid_sz = u.levels[0].bid_sz;
-                            last_und_ask_sz = u.levels[0].ask_sz;
+    let mut last_und_bid = 0.0f64;
+    let mut last_und_ask = 0.0f64;
+    let mut last_und_bid_sz = 0u32;
+    let mut last_und_ask_sz = 0u32;
+
+    println!("Starting Merge ({} options file(s))...", opt_decoders.len());
+
+    loop {
+        // Pick the slot with the smallest timestamp
+        let min_idx = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|(ts, _)| (i, *ts)))
+            .min_by_key(|&(_, ts)| ts)
+            .map(|(i, _)| i);
+
+        let idx = match min_idx {
+            Some(i) => i,
+            None => break,
+        };
+
+        if let Some((_, msg)) = slots[idx].take() {
+            match msg {
+                StreamMsg::Underlying(u) => {
+                    let price = (u.price as f64) * 1e-9;
+                    if !u.levels.is_empty() {
+                        last_und_bid = (u.levels[0].bid_px as f64) * 1e-9;
+                        last_und_ask = (u.levels[0].ask_px as f64) * 1e-9;
+                        last_und_bid_sz = u.levels[0].bid_sz;
+                        last_und_ask_sz = u.levels[0].ask_sz;
+                    }
+                    writer.write_record(&[
+                        u.hd.ts_event.to_string(),
+                        "UND".to_string(),
+                        "0".to_string(),
+                        "UNDERLYING".to_string(),
+                        price.to_string(),
+                        u.size.to_string(),
+                        "".to_string(),
+                        "".to_string(),
+                        "".to_string(),
+                        last_und_bid.to_string(),
+                        last_und_ask.to_string(),
+                        last_und_bid_sz.to_string(),
+                        last_und_ask_sz.to_string(),
+                    ])?;
+                    // Refill underlying
+                    if let Some(dec) = &mut und_decoder {
+                        if let Ok(Some(m)) = dec.decode_record::<Mbp1Msg>().await {
+                            slots[0] = Some((m.hd.ts_event, StreamMsg::Underlying(m.clone())));
                         }
+                    }
+                }
+                StreamMsg::Option(o) => {
+                    if let Some(def) = def_map.get(&o.hd.instrument_id) {
+                        let price = (o.price as f64) * 1e-9;
                         writer.write_record(&[
-                            u.hd.ts_event.to_string(),
-                            "UND".to_string(),
-                            "0".to_string(),
-                            "UNDERLYING".to_string(),
+                            o.hd.ts_event.to_string(),
+                            "OPT".to_string(),
+                            o.hd.instrument_id.to_string(),
+                            def.symbol.clone(),
                             price.to_string(),
-                            u.size.to_string(),
-                            "".to_string(),
-                            "".to_string(),
-                            "".to_string(),
+                            o.size.to_string(),
+                            def.strike_price.to_string(),
+                            def.expiration.to_string(),
+                            def.option_type.clone(),
                             last_und_bid.to_string(),
                             last_und_ask.to_string(),
                             last_und_bid_sz.to_string(),
                             last_und_ask_sz.to_string(),
                         ])?;
                     }
-                    StreamMsg::Option(o) => {
-                        // Lookup is now safe because def_map is fully populated
-                        if let Some(def) = def_map.get(&o.hd.instrument_id) {
-                            let price = (o.price as f64) * 1e-9;
-                            writer.write_record(&[
-                                o.hd.ts_event.to_string(),
-                                "OPT".to_string(),
-                                o.hd.instrument_id.to_string(),
-                                def.symbol.clone(),
-                                price.to_string(),
-                                o.size.to_string(),
-                                def.strike_price.to_string(),
-                                def.expiration.to_string(),
-                                def.option_type.clone(),
-                                last_und_bid.to_string(),
-                                last_und_ask.to_string(),
-                                last_und_bid_sz.to_string(),
-                                last_und_ask_sz.to_string(),
-                            ])?;
-                        }
-                        // If ID is not in map, we silently skip.
-                    }
-                }
-
-                // Refill
-                match idx {
-                    0 => {
-                        if let Some(d) = &mut und_decoder {
-                            if let Ok(Some(m)) = d.decode_record::<Mbp1Msg>().await {
-                                streams[0] =
-                                    Some((m.hd.ts_event, StreamMsg::Underlying(m.clone())));
-                            }
+                    // Refill this options slot
+                    let opt_idx = idx - 1;
+                    if let Some(dec) = &mut opt_decoders[opt_idx] {
+                        if let Ok(Some(m)) = dec.decode_record::<TradeMsg>().await {
+                            slots[idx] = Some((m.hd.ts_event, StreamMsg::Option(m.clone())));
                         }
                     }
-                    1 => {
-                        if let Some(d) = &mut opt_decoder {
-                            if let Ok(Some(m)) = d.decode_record::<TradeMsg>().await {
-                                streams[1] = Some((m.hd.ts_event, StreamMsg::Option(m.clone())));
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
                 }
             }
-        } else {
-            break;
         }
     }
 

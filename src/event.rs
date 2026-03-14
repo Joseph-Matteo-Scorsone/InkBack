@@ -64,6 +64,26 @@ impl MarketEvent {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn side(&self) -> Option<char> {
+        match self {
+            MarketEvent::Trade(m) => Some(m.side as u8 as char),
+            MarketEvent::Mbp1(m) => Some(m.side as u8 as char),
+            MarketEvent::Mbo(m) => Some(m.side as u8 as char),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn size(&self) -> Option<u32> {
+        match self {
+            MarketEvent::Trade(m) => Some(m.size),
+            MarketEvent::Mbp1(m) => Some(m.size),
+            MarketEvent::Mbo(m) => Some(m.size),
+            _ => None,
+        }
+    }
+
     pub fn high(&self) -> f64 {
         const SCALE: f64 = 1e-9;
         match self {

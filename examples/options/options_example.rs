@@ -386,8 +386,8 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // Define historical data range
-    let start = date!(2025 - 11 - 01).with_time(time!(00:00)).assume_utc();
-    let end = date!(2025 - 12 - 20).with_time(time!(00:00)).assume_utc();
+    let start = date!(2026 - 01 - 05).with_time(time!(00:00)).assume_utc();
+    let end = date!(2026 - 01 - 12).with_time(time!(00:00)).assume_utc();
 
     let starting_equity = 100_000.00;
     let exposure = 0.50; // % of capital allocated to each trade
@@ -405,15 +405,16 @@ async fn main() -> anyhow::Result<()> {
         Some(InkBackSchema::CombinedOptionsUnderlying),
         start,
         end,
+        None,
     )
     .await?;
 
     // Define parameter ranges for the momentum strategy
     let lookback_periods = vec![10]; // Momentum calculation periods
     let momentum_thresholds = vec![0.00001, 0.001]; // Momentum Threshold
-    let profit_targets = vec![40.0]; // % profit targets
-    let stop_losses = vec![30.0]; // % stop losses
-    let min_days_to_expiry = vec![1.0]; // dte
+    let profit_targets = vec![10.0]; // % profit targets
+    let stop_losses = vec![10.0]; // % stop losses
+    let min_days_to_expiry = vec![10.0]; // dte
 
     // Generate all parameter combinations
     let mut parameter_combinations = Vec::new();
