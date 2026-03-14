@@ -304,7 +304,7 @@ The `plot_walk_forward` and `plot_equity_curves` functions open an interactive e
 - Side panel with toggleable curve visibility
 - Built-in zoom, pan, and legend
 
-![alt text](https://x.com/ScorEnterprises/status/2032952720697512182/photo/1)
+![alt text](https://pbs.twimg.com/media/HDZ_t8cWoAMsxEz?format=jpg&name=small)
 
 ## License
 
