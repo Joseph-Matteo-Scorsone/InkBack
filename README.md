@@ -143,7 +143,7 @@ let result = run_backtest(
     exposure,       // Fraction of equity allocated per trade (e.g. 0.50)
     schema,
     None,           // custom_schema
-    None,           // bar interval for footprint schema
+    None,           // custom interval
 ).await?;
 ```
 
