@@ -299,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
         Some(InkBackSchema::FootPrint),
         start,
         end,
-        bar_interval,
+        Some(bar_interval),
     )
     .await?;
 
