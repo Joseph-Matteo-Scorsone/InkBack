@@ -289,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
     let es_tick_size: f64 = 0.25;
     let transaction_costs = TransactionCosts::futures_trading(es_tick_size);
     let symbol = "NQ.v.0";
-    let bar_interval = 30_000_000_000u64; // 30 seconds
+    let bar_interval = 15_000_000_000u64; // 15 seconds
     let symbol_manager = fetch_and_save_data(
         "GLBX.MDP3",
         SType::Continuous,
